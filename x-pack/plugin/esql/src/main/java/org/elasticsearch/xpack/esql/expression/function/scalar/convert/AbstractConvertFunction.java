@@ -19,14 +19,13 @@ import org.elasticsearch.compute.operator.EvalOperator;
 import org.elasticsearch.compute.operator.EvalOperator.ExpressionEvaluator;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
-import org.elasticsearch.xpack.esql.evaluator.mapper.EvaluatorMapper;
+import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.DataTypes;
 import org.elasticsearch.xpack.esql.expression.function.Warnings;
 import org.elasticsearch.xpack.esql.expression.function.scalar.UnaryScalarFunction;
 import org.elasticsearch.xpack.esql.type.EsqlDataTypes;
-import org.elasticsearch.xpack.ql.expression.Expression;
-import org.elasticsearch.xpack.ql.tree.Source;
-import org.elasticsearch.xpack.ql.type.DataType;
-import org.elasticsearch.xpack.ql.type.DataTypes;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -36,12 +35,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 
-import static org.elasticsearch.xpack.ql.expression.TypeResolutions.isType;
+import static org.elasticsearch.xpack.esql.core.expression.TypeResolutions.isType;
 
 /**
  * Base class for functions that converts a field into a function-specific type.
  */
-public abstract class AbstractConvertFunction extends UnaryScalarFunction implements EvaluatorMapper {
+public abstract class AbstractConvertFunction extends UnaryScalarFunction {
 
     // the numeric types convert functions need to handle; the other numeric types are converted upstream to one of these
     private static final List<DataType> NUMERIC_TYPES = List.of(
@@ -100,11 +99,6 @@ public abstract class AbstractConvertFunction extends UnaryScalarFunction implem
     }
 
     protected abstract Map<DataType, BuildFactory> factories();
-
-    @Override
-    public final Object fold() {
-        return EvaluatorMapper.super.fold();
-    }
 
     @Override
     public ExpressionEvaluator.Factory toEvaluator(Function<Expression, ExpressionEvaluator.Factory> toEvaluator) {

@@ -33,6 +33,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * A collection of static methods to help create different ES Executor types.
+ */
 public class EsExecutors {
 
     // although the available processors may technically change, for node sizing we use the number available at launch
@@ -261,6 +264,16 @@ public class EsExecutors {
     public static String threadName(final String nodeName, final String namePrefix) {
         // TODO missing node names should only be allowed in tests
         return "elasticsearch" + (nodeName.isEmpty() ? "" : "[") + nodeName + (nodeName.isEmpty() ? "" : "]") + "[" + namePrefix + "]";
+    }
+
+    public static String executorName(String threadName) {
+        // subtract 2 to avoid the `]` of the thread number part.
+        int executorNameEnd = threadName.lastIndexOf(']', threadName.length() - 2);
+        int executorNameStart = threadName.lastIndexOf('[', executorNameEnd);
+        if (executorNameStart == -1 || executorNameEnd - executorNameStart <= 1) {
+            return null;
+        }
+        return threadName.substring(executorNameStart + 1, executorNameEnd);
     }
 
     public static ThreadFactory daemonThreadFactory(Settings settings, String namePrefix) {

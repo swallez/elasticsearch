@@ -26,7 +26,7 @@ public class UpdateDatafeedAction extends ActionType<PutDatafeedAction.Response>
     public static final String NAME = "cluster:admin/xpack/ml/datafeeds/update";
 
     private UpdateDatafeedAction() {
-        super(NAME, PutDatafeedAction.Response::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> implements ToXContentObject {
@@ -43,6 +43,7 @@ public class UpdateDatafeedAction extends ActionType<PutDatafeedAction.Response>
         private DatafeedUpdate update;
 
         public Request(DatafeedUpdate update) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.update = update;
         }
 

@@ -55,7 +55,7 @@ public class NodesDataTiersUsageTransportAction extends TransportNodesAction<
     NodesDataTiersUsageTransportAction.NodeRequest,
     NodeDataTiersUsage> {
 
-    public static final ActionType<NodesResponse> TYPE = ActionType.localOnly("cluster:monitor/nodes/data_tier_usage");
+    public static final ActionType<NodesResponse> TYPE = new ActionType<>("cluster:monitor/nodes/data_tier_usage");
     public static final NodeFeature LOCALLY_PRECALCULATED_STATS_FEATURE = new NodeFeature("usage.data_tiers.precalculate_stats");
 
     private static final CommonStatsFlags STATS_FLAGS = new CommonStatsFlags().clear()
@@ -90,7 +90,7 @@ public class NodesDataTiersUsageTransportAction extends TransportNodesAction<
 
     @Override
     protected NodeRequest newNodeRequest(NodesRequest request) {
-        return NodeRequest.INSTANCE;
+        return new NodeRequest();
     }
 
     @Override
@@ -175,8 +175,6 @@ public class NodesDataTiersUsageTransportAction extends TransportNodesAction<
     }
 
     public static class NodeRequest extends TransportRequest {
-
-        static final NodeRequest INSTANCE = new NodeRequest();
 
         public NodeRequest(StreamInput in) throws IOException {
             super(in);

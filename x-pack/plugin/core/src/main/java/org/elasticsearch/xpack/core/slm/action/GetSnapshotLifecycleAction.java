@@ -27,14 +27,15 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
     public static final String NAME = "cluster:admin/slm/get";
 
     protected GetSnapshotLifecycleAction() {
-        super(NAME, GetSnapshotLifecycleAction.Response::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<GetSnapshotLifecycleAction.Request> {
 
-        private String[] lifecycleIds;
+        private final String[] lifecycleIds;
 
         public Request(String... lifecycleIds) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.lifecycleIds = Objects.requireNonNull(lifecycleIds, "ids may not be null");
         }
 
@@ -44,6 +45,7 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
         }
 
         public Request() {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.lifecycleIds = Strings.EMPTY_ARRAY;
         }
 

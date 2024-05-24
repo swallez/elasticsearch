@@ -129,6 +129,7 @@ import org.elasticsearch.index.translog.TranslogConfig;
 import org.elasticsearch.index.translog.TranslogDeletionPolicy;
 import org.elasticsearch.index.translog.TranslogOperationsUtils;
 import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+import org.elasticsearch.plugins.internal.DocumentSizeObserver;
 import org.elasticsearch.test.IndexSettingsModule;
 import org.elasticsearch.test.index.IndexVersionUtils;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -175,6 +176,7 @@ import java.util.stream.LongStream;
 import java.util.stream.StreamSupport;
 
 import static java.util.Collections.shuffle;
+import static org.elasticsearch.cluster.routing.TestShardRouting.shardRoutingBuilder;
 import static org.elasticsearch.common.lucene.Lucene.indexWriterConfigWithNoMerging;
 import static org.elasticsearch.index.engine.Engine.ES_VERSION;
 import static org.elasticsearch.index.engine.Engine.Operation.Origin.LOCAL_RESET;
@@ -2670,14 +2672,9 @@ public class InternalEngineTests extends EngineTestCase {
 
         try {
             initialEngine = createEngine(defaultSettings, store, createTempDir(), newLogMergePolicy(), null);
-            final ShardRouting primary = TestShardRouting.newShardRouting(
-                shardId,
-                "node1",
-                null,
-                true,
-                ShardRoutingState.STARTED,
+            final ShardRouting primary = shardRoutingBuilder(shardId, "node1", true, ShardRoutingState.STARTED).withAllocationId(
                 allocationId
-            );
+            ).build();
             final ShardRouting initializingReplica = TestShardRouting.newShardRouting(
                 shardId,
                 "node2",
@@ -5528,7 +5525,8 @@ public class InternalEngineTests extends EngineTestCase {
                 Collections.singletonList(document),
                 source,
                 XContentType.JSON,
-                null
+                null,
+                DocumentSizeObserver.EMPTY_INSTANCE
             );
 
             final Engine.Index index = new Engine.Index(

@@ -24,7 +24,7 @@ public class PutEnrichPolicyAction extends ActionType<AcknowledgedResponse> {
     public static final String NAME = "cluster:admin/xpack/enrich/put";
 
     private PutEnrichPolicyAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static Request fromXContent(XContentParser parser, String name) throws IOException {
@@ -37,6 +37,7 @@ public class PutEnrichPolicyAction extends ActionType<AcknowledgedResponse> {
         private final String name;
 
         public Request(String name, EnrichPolicy policy) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT);
             this.name = Objects.requireNonNull(name, "name cannot be null");
             this.policy = policy;
         }

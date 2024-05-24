@@ -12,6 +12,7 @@ import org.elasticsearch.action.support.master.AcknowledgedRequest;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.core.TimeValue;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -22,7 +23,7 @@ public class DeleteAutoscalingPolicyAction extends ActionType<AcknowledgedRespon
     public static final String NAME = "cluster:admin/autoscaling/delete_autoscaling_policy";
 
     private DeleteAutoscalingPolicyAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<DeleteAutoscalingPolicyAction.Request> {
@@ -33,7 +34,8 @@ public class DeleteAutoscalingPolicyAction extends ActionType<AcknowledgedRespon
             return name;
         }
 
-        public Request(final String name) {
+        public Request(TimeValue masterNodeTimeout, TimeValue ackTimeout, final String name) {
+            super(masterNodeTimeout, ackTimeout);
             this.name = Objects.requireNonNull(name);
         }
 

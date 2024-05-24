@@ -24,7 +24,7 @@ public class DeleteTrainedModelAliasAction extends ActionType<AcknowledgedRespon
     public static final String NAME = "cluster:admin/xpack/ml/inference/model_aliases/delete";
 
     private DeleteTrainedModelAliasAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> {
@@ -35,6 +35,7 @@ public class DeleteTrainedModelAliasAction extends ActionType<AcknowledgedRespon
         private final String modelId;
 
         public Request(String modelAlias, String modelId) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.modelAlias = ExceptionsHelper.requireNonNull(modelAlias, MODEL_ALIAS);
             this.modelId = ExceptionsHelper.requireNonNull(modelId, TrainedModelConfig.MODEL_ID);
         }

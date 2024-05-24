@@ -27,7 +27,7 @@ public class DeleteTrainedModelAction extends ActionType<AcknowledgedResponse> {
     public static final String NAME = "cluster:admin/xpack/ml/inference/delete";
 
     private DeleteTrainedModelAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> implements ToXContentFragment {
@@ -48,6 +48,7 @@ public class DeleteTrainedModelAction extends ActionType<AcknowledgedResponse> {
         }
 
         public Request(String id) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.id = ExceptionsHelper.requireNonNull(id, TrainedModelConfig.MODEL_ID);
         }
 

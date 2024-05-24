@@ -33,7 +33,7 @@ public class ResetJobAction extends ActionType<AcknowledgedResponse> {
     public static final TransportVersion TRANSPORT_VERSION_INTRODUCED = TransportVersions.V_7_14_0;
 
     private ResetJobAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> {
@@ -57,6 +57,7 @@ public class ResetJobAction extends ActionType<AcknowledgedResponse> {
         private boolean deleteUserAnnotations;
 
         public Request(String jobId) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.jobId = ExceptionsHelper.requireNonNull(jobId, Job.ID);
         }
 

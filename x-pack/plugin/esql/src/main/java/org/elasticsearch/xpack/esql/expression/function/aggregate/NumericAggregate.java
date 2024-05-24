@@ -8,18 +8,17 @@ package org.elasticsearch.xpack.esql.expression.function.aggregate;
 
 import org.elasticsearch.compute.aggregation.AggregatorFunctionSupplier;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
+import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.TypeResolutions;
+import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.DataTypes;
 import org.elasticsearch.xpack.esql.planner.ToAggregator;
-import org.elasticsearch.xpack.ql.expression.Expression;
-import org.elasticsearch.xpack.ql.expression.TypeResolutions;
-import org.elasticsearch.xpack.ql.expression.function.aggregate.AggregateFunction;
-import org.elasticsearch.xpack.ql.tree.Source;
-import org.elasticsearch.xpack.ql.type.DataType;
-import org.elasticsearch.xpack.ql.type.DataTypes;
 
 import java.util.List;
 
-import static org.elasticsearch.xpack.ql.expression.TypeResolutions.ParamOrdinal.DEFAULT;
-import static org.elasticsearch.xpack.ql.expression.TypeResolutions.isNumeric;
+import static org.elasticsearch.xpack.esql.core.expression.TypeResolutions.ParamOrdinal.DEFAULT;
+import static org.elasticsearch.xpack.esql.core.expression.TypeResolutions.isType;
 
 public abstract class NumericAggregate extends AggregateFunction implements ToAggregator {
 
@@ -36,14 +35,20 @@ public abstract class NumericAggregate extends AggregateFunction implements ToAg
         if (supportsDates()) {
             return TypeResolutions.isType(
                 this,
-                e -> e.isNumeric() || e == DataTypes.DATETIME,
+                e -> e == DataTypes.DATETIME || e.isNumeric() && e != DataTypes.UNSIGNED_LONG,
                 sourceText(),
                 DEFAULT,
-                "numeric",
-                "datetime"
+                "datetime",
+                "numeric except unsigned_long or counter types"
             );
         }
-        return isNumeric(field(), sourceText(), DEFAULT);
+        return isType(
+            field(),
+            dt -> dt.isNumeric() && dt != DataTypes.UNSIGNED_LONG,
+            sourceText(),
+            DEFAULT,
+            "numeric except unsigned_long or counter types"
+        );
     }
 
     protected boolean supportsDates() {

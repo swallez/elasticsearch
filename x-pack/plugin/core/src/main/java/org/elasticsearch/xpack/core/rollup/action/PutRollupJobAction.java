@@ -29,7 +29,7 @@ public class PutRollupJobAction extends ActionType<AcknowledgedResponse> {
     public static final String NAME = "cluster:admin/xpack/rollup/put";
 
     private PutRollupJobAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> implements IndicesRequest, ToXContentObject {
@@ -38,6 +38,7 @@ public class PutRollupJobAction extends ActionType<AcknowledgedResponse> {
         private IndicesOptions indicesOptions = IndicesOptions.fromOptions(false, false, true, false);
 
         public Request(RollupJobConfig config) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.config = config;
         }
 
@@ -48,6 +49,7 @@ public class PutRollupJobAction extends ActionType<AcknowledgedResponse> {
 
         public Request() {
 
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
         }
 
         public static Request fromXContent(final XContentParser parser, final String id) throws IOException {

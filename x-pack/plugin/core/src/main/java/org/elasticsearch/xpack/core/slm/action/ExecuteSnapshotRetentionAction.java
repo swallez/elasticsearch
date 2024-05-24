@@ -21,12 +21,14 @@ public class ExecuteSnapshotRetentionAction extends ActionType<AcknowledgedRespo
     public static final String NAME = "cluster:admin/slm/execute-retention";
 
     protected ExecuteSnapshotRetentionAction() {
-        super(NAME, AcknowledgedResponse::readFrom);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<ExecuteSnapshotRetentionAction.Request> implements ToXContentObject {
 
-        public Request() {}
+        public Request() {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
+        }
 
         public Request(StreamInput in) throws IOException {
             super(in);

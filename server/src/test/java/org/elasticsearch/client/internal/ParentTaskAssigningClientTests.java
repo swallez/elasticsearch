@@ -12,6 +12,7 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
+import org.elasticsearch.action.RemoteClusterActionType;
 import org.elasticsearch.action.admin.cluster.state.ClusterStateAction;
 import org.elasticsearch.action.admin.cluster.state.ClusterStateRequest;
 import org.elasticsearch.action.admin.cluster.state.ClusterStateResponse;
@@ -23,6 +24,8 @@ import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.tasks.TaskId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.client.NoOpClient;
+import org.elasticsearch.transport.RemoteClusterService;
+import org.elasticsearch.transport.TransportResponse;
 
 import java.util.concurrent.Executor;
 
@@ -65,11 +68,15 @@ public class ParentTaskAssigningClientTests extends ESTestCase {
         try (var threadPool = createThreadPool()) {
             final var mockClient = new NoOpClient(threadPool) {
                 @Override
-                public RemoteClusterClient getRemoteClusterClient(String clusterAlias, Executor responseExecutor) {
+                public RemoteClusterClient getRemoteClusterClient(
+                    String clusterAlias,
+                    Executor responseExecutor,
+                    RemoteClusterService.DisconnectedStrategy disconnectedStrategy
+                ) {
                     return new RemoteClusterClient() {
                         @Override
-                        public <Request extends ActionRequest, Response extends ActionResponse> void execute(
-                            ActionType<Response> action,
+                        public <Request extends ActionRequest, Response extends TransportResponse> void execute(
+                            RemoteClusterActionType<Response> action,
                             Request request,
                             ActionListener<Response> listener
                         ) {
@@ -81,13 +88,17 @@ public class ParentTaskAssigningClientTests extends ESTestCase {
             };
 
             final var client = new ParentTaskAssigningClient(mockClient, parentTaskId);
-            final var remoteClusterClient = client.getRemoteClusterClient("remote-cluster", EsExecutors.DIRECT_EXECUTOR_SERVICE);
+            final var remoteClusterClient = client.getRemoteClusterClient(
+                "remote-cluster",
+                EsExecutors.DIRECT_EXECUTOR_SERVICE,
+                randomFrom(RemoteClusterService.DisconnectedStrategy.values())
+            );
             assertEquals(
                 "fake remote-cluster client",
                 expectThrows(
                     UnsupportedOperationException.class,
                     () -> PlainActionFuture.<ClusterStateResponse, Exception>get(
-                        fut -> remoteClusterClient.execute(ClusterStateAction.INSTANCE, new ClusterStateRequest(), fut)
+                        fut -> remoteClusterClient.execute(ClusterStateAction.REMOTE_TYPE, new ClusterStateRequest(), fut)
                     )
                 ).getMessage()
             );

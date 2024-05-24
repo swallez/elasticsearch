@@ -51,6 +51,7 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import static org.elasticsearch.core.Strings.format;
 
@@ -180,6 +181,7 @@ public abstract class FieldMapper extends Mapper {
             if (hasScript) {
                 throwIndexingWithScriptParam();
             }
+
             parseCreateField(context);
         } catch (Exception e) {
             rethrowAsDocumentParsingException(context, e);
@@ -428,8 +430,64 @@ public abstract class FieldMapper extends Mapper {
 
     protected abstract String contentType();
 
+    @Override
+    public int getTotalFieldsCount() {
+        return 1 + Stream.of(multiFields.mappers).mapToInt(FieldMapper::getTotalFieldsCount).sum();
+    }
+
     public Map<String, NamedAnalyzer> indexAnalyzers() {
         return Map.of();
+    }
+
+    /**
+     * Specifies the mode of synthetic source support by the mapper.
+     *
+     * <pre>
+     * {@link NATIVE} - mapper natively supports synthetic source, f.e. by constructing it from doc values.
+     *
+     * {@link FALLBACK} - mapper does not have native support but uses fallback implementation.
+     * This is a temporary variant that exists in order to roll out fallback implementation on a per field basis.
+     *
+     * {@link NOT_SUPPORTED} - synthetic source is not supported.
+     * </pre>
+     */
+    protected enum SyntheticSourceMode {
+        NATIVE,
+        FALLBACK,
+        NOT_SUPPORTED
+    }
+
+    /**
+     * Specifies the mode of synthetic source support by the mapper.
+     *
+     * @return {@link SyntheticSourceMode}
+     */
+    protected SyntheticSourceMode syntheticSourceMode() {
+        return SyntheticSourceMode.NOT_SUPPORTED;
+    }
+
+    /**
+     * Mappers override this method with native synthetic source support.
+     * If mapper does not support synthetic source, it is generated using generic implementation
+     * in {@link DocumentParser#parseObjectOrField} and {@link ObjectMapper#syntheticFieldLoader()}.
+     *
+     * @return implementation of {@link SourceLoader.SyntheticFieldLoader}
+     */
+    @Override
+    public SourceLoader.SyntheticFieldLoader syntheticFieldLoader() {
+        // If mapper supports synthetic source natively, it overrides this method,
+        // /so we won't see those here.
+        if (syntheticSourceMode() == SyntheticSourceMode.FALLBACK) {
+            if (copyTo.copyToFields().isEmpty() != true) {
+                throw new IllegalArgumentException(
+                    "field [" + name() + "] of type [" + typeName() + "] doesn't support synthetic source because it declares copy_to"
+                );
+            }
+            // Nothing because it is handled at `ObjectMapper` level.
+            return SourceLoader.SyntheticFieldLoader.NOTHING;
+        }
+
+        return super.syntheticFieldLoader();
     }
 
     public static final class MultiFields implements Iterable<FieldMapper>, ToXContent {
@@ -444,28 +502,47 @@ public abstract class FieldMapper extends Mapper {
 
             private final Map<String, Function<MapperBuilderContext, FieldMapper>> mapperBuilders = new HashMap<>();
 
+            private boolean hasSyntheticSourceCompatibleKeywordField;
+
             public Builder add(FieldMapper.Builder builder) {
                 mapperBuilders.put(builder.name(), builder::build);
+
+                if (builder instanceof KeywordFieldMapper.Builder kwd) {
+                    if (kwd.hasNormalizer() == false && (kwd.hasDocValues() || kwd.isStored())) {
+                        hasSyntheticSourceCompatibleKeywordField = true;
+                    }
+                }
+
                 return this;
             }
 
-            public Builder add(FieldMapper mapper) {
+            private void add(FieldMapper mapper) {
                 mapperBuilders.put(mapper.simpleName(), context -> mapper);
-                return this;
+
+                if (mapper instanceof KeywordFieldMapper kwd) {
+                    if (kwd.hasNormalizer() == false && (kwd.fieldType().hasDocValues() || kwd.fieldType().isStored())) {
+                        hasSyntheticSourceCompatibleKeywordField = true;
+                    }
+                }
             }
 
-            public Builder update(FieldMapper toMerge, MapperMergeContext context) {
+            private void update(FieldMapper toMerge, MapperMergeContext context) {
                 if (mapperBuilders.containsKey(toMerge.simpleName()) == false) {
-                    add(toMerge);
+                    if (context.decrementFieldBudgetIfPossible(toMerge.getTotalFieldsCount())) {
+                        add(toMerge);
+                    }
                 } else {
                     FieldMapper existing = mapperBuilders.get(toMerge.simpleName()).apply(context.getMapperBuilderContext());
                     add(existing.merge(toMerge, context));
                 }
-                return this;
             }
 
             public boolean hasMultiFields() {
                 return mapperBuilders.isEmpty() == false;
+            }
+
+            public boolean hasSyntheticSourceCompatibleKeywordField() {
+                return hasSyntheticSourceCompatibleKeywordField;
             }
 
             public MultiFields build(Mapper.Builder mainFieldBuilder, MapperBuilderContext context) {
@@ -473,7 +550,7 @@ public abstract class FieldMapper extends Mapper {
                     return empty();
                 } else {
                     FieldMapper[] mappers = new FieldMapper[mapperBuilders.size()];
-                    context = context.createChildContext(mainFieldBuilder.name());
+                    context = context.createChildContext(mainFieldBuilder.name(), null);
                     int i = 0;
                     for (Map.Entry<String, Function<MapperBuilderContext, FieldMapper>> entry : this.mapperBuilders.entrySet()) {
                         mappers[i++] = entry.getValue().apply(context);
@@ -1128,6 +1205,10 @@ public abstract class FieldMapper extends Mapper {
             return Parameter.boolParam("store", false, initializer, defaultValue);
         }
 
+        public static Parameter<Boolean> storeParam(Function<FieldMapper, Boolean> initializer, Supplier<Boolean> defaultValue) {
+            return Parameter.boolParam("store", false, initializer, defaultValue);
+        }
+
         public static Parameter<Boolean> docValuesParam(Function<FieldMapper, Boolean> initializer, boolean defaultValue) {
             return Parameter.boolParam("doc_values", false, initializer, defaultValue);
         }
@@ -1170,7 +1251,7 @@ public abstract class FieldMapper extends Mapper {
         private final String mapperName;
         private final List<String> conflicts = new ArrayList<>();
 
-        Conflicts(String mapperName) {
+        public Conflicts(String mapperName) {
             this.mapperName = mapperName;
         }
 
@@ -1182,7 +1263,7 @@ public abstract class FieldMapper extends Mapper {
             conflicts.add("Cannot update parameter [" + parameter + "] from [" + existing + "] to [" + toMerge + "]");
         }
 
-        void check() {
+        public void check() {
             if (conflicts.isEmpty()) {
                 return;
             }
@@ -1224,7 +1305,7 @@ public abstract class FieldMapper extends Mapper {
             for (Parameter<?> param : getParameters()) {
                 param.merge(in, conflicts);
             }
-            MapperMergeContext childContext = mapperMergeContext.createChildContext(in.simpleName());
+            MapperMergeContext childContext = mapperMergeContext.createChildContext(in.simpleName(), null);
             for (FieldMapper newSubField : in.multiFields.mappers) {
                 multiFieldsBuilder.update(newSubField, childContext);
             }
@@ -1409,10 +1490,38 @@ public abstract class FieldMapper extends Mapper {
         }
     }
 
+    /**
+     * Creates mappers for fields that can act as time-series dimensions.
+     */
+    public abstract static class DimensionBuilder extends Builder {
+
+        private boolean inheritDimensionParameterFromParentObject = false;
+
+        public DimensionBuilder(String name) {
+            super(name);
+        }
+
+        void setInheritDimensionParameterFromParentObject() {
+            this.inheritDimensionParameterFromParentObject = true;
+        }
+
+        protected boolean inheritDimensionParameterFromParentObject(MapperBuilderContext context) {
+            return inheritDimensionParameterFromParentObject || context.parentObjectContainsDimensions();
+        }
+    }
+
     public static BiConsumer<String, MappingParserContext> notInMultiFields(String type) {
         return (n, c) -> {
             if (c.isWithinMultiField()) {
                 throw new MapperParsingException("Field [" + n + "] of type [" + type + "] can't be used in multifields");
+            }
+        };
+    }
+
+    public static BiConsumer<String, MappingParserContext> notFromDynamicTemplates(String type) {
+        return (n, c) -> {
+            if (c.isFromDynamicTemplate()) {
+                throw new MapperParsingException("Field [" + n + "] of type [" + type + "] can't be used in dynamic templates");
             }
         };
     }
@@ -1447,6 +1556,13 @@ public abstract class FieldMapper extends Mapper {
             BiConsumer<String, MappingParserContext> contextValidator
         ) {
             this(builderFunction, contextValidator, IndexVersions.MINIMUM_COMPATIBLE);
+        }
+
+        public TypeParser(
+            BiFunction<String, MappingParserContext, Builder> builderFunction,
+            List<BiConsumer<String, MappingParserContext>> contextValidator
+        ) {
+            this(builderFunction, (n, c) -> contextValidator.forEach(v -> v.accept(n, c)), IndexVersions.MINIMUM_COMPATIBLE);
         }
 
         private TypeParser(

@@ -26,7 +26,7 @@ public class PutDatafeedAction extends ActionType<PutDatafeedAction.Response> {
     public static final String NAME = "cluster:admin/xpack/ml/datafeeds/put";
 
     private PutDatafeedAction() {
-        super(NAME, Response::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> implements ToXContentObject {
@@ -40,9 +40,10 @@ public class PutDatafeedAction extends ActionType<PutDatafeedAction.Response> {
             return new Request(datafeed.build());
         }
 
-        private DatafeedConfig datafeed;
+        private final DatafeedConfig datafeed;
 
         public Request(DatafeedConfig datafeed) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.datafeed = datafeed;
         }
 
@@ -83,7 +84,7 @@ public class PutDatafeedAction extends ActionType<PutDatafeedAction.Response> {
 
     public static class Response extends ActionResponse implements ToXContentObject {
 
-        private DatafeedConfig datafeed;
+        private final DatafeedConfig datafeed;
 
         public Response(DatafeedConfig datafeed) {
             this.datafeed = datafeed;

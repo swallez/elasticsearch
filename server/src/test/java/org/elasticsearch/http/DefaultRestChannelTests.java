@@ -20,7 +20,7 @@ import org.elasticsearch.common.bytes.ReleasableBytesReference;
 import org.elasticsearch.common.io.stream.BytesStream;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.RecyclerBytesStreamOutput;
-import org.elasticsearch.common.logging.ChunkedLoggingStreamTests;
+import org.elasticsearch.common.logging.ChunkedLoggingStreamTestUtils;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
@@ -38,7 +38,7 @@ import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.telemetry.tracing.Tracer;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.test.MockLogAppender;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.test.junit.annotations.TestLogging;
 import org.elasticsearch.test.rest.FakeRestRequest;
 import org.elasticsearch.threadpool.TestThreadPool;
@@ -543,12 +543,7 @@ public class DefaultRestChannelTests extends ESTestCase {
                 public String getResponseContentTypeString() {
                     return RestResponse.TEXT_CONTENT_TYPE;
                 }
-
-                @Override
-                public void close() {
-                    assertTrue(isClosed.compareAndSet(false, true));
-                }
-            }));
+            }, () -> assertTrue(isClosed.compareAndSet(false, true))));
             @SuppressWarnings("unchecked")
             Class<ActionListener<Void>> listenerClass = (Class<ActionListener<Void>>) (Class<?>) ActionListener.class;
             ArgumentCaptor<ActionListener<Void>> listenerCaptor = ArgumentCaptor.forClass(listenerClass);
@@ -592,10 +587,9 @@ public class DefaultRestChannelTests extends ESTestCase {
             tracer
         );
 
-        final MockLogAppender sendingResponseMockLog = new MockLogAppender();
-        try (var ignored = sendingResponseMockLog.capturing(HttpTracer.class)) {
+        try (var sendingResponseMockLog = MockLog.capture(HttpTracer.class)) {
             sendingResponseMockLog.addExpectation(
-                new MockLogAppender.UnseenEventExpectation(
+                new MockLog.UnseenEventExpectation(
                     "no response should be logged",
                     HttpTracer.class.getName(),
                     Level.TRACE,
@@ -609,10 +603,9 @@ public class DefaultRestChannelTests extends ESTestCase {
             sendingResponseMockLog.assertAllExpectationsMatched();
         }
 
-        final MockLogAppender sendingResponseCompleteMockLog = new MockLogAppender();
-        try (var ignored = sendingResponseCompleteMockLog.capturing(HttpTracer.class)) {
+        try (var sendingResponseCompleteMockLog = MockLog.capture(HttpTracer.class)) {
             sendingResponseCompleteMockLog.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
+                new MockLog.SeenEventExpectation(
                     "response should be logged",
                     HttpTracer.class.getName(),
                     Level.TRACE,
@@ -654,10 +647,9 @@ public class DefaultRestChannelTests extends ESTestCase {
             tracer
         );
 
-        MockLogAppender mockLogAppender = new MockLogAppender();
-        try (var ignored = mockLogAppender.capturing(HttpTracer.class)) {
-            mockLogAppender.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
+        try (var mockLog = MockLog.capture(HttpTracer.class)) {
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
                     "response should be logged with success = false",
                     HttpTracer.class.getName(),
                     Level.TRACE,
@@ -666,7 +658,7 @@ public class DefaultRestChannelTests extends ESTestCase {
             );
 
             expectThrows(RuntimeException.class, () -> channel.sendResponse(new RestResponse(RestStatus.OK, "ignored")));
-            mockLogAppender.assertAllExpectationsMatched();
+            mockLog.assertAllExpectationsMatched();
         }
     }
 
@@ -713,7 +705,7 @@ public class DefaultRestChannelTests extends ESTestCase {
         var responseBody = new BytesArray(randomUnicodeOfLengthBetween(1, 100).getBytes(StandardCharsets.UTF_8));
         assertEquals(
             responseBody,
-            ChunkedLoggingStreamTests.getDecodedLoggedBody(
+            ChunkedLoggingStreamTestUtils.getDecodedLoggedBody(
                 LogManager.getLogger(HttpTracerTests.HTTP_BODY_TRACER_LOGGER),
                 Level.TRACE,
                 "[" + request.getRequestId() + "] response body",
@@ -725,7 +717,7 @@ public class DefaultRestChannelTests extends ESTestCase {
         final var isClosed = new AtomicBoolean();
         assertEquals(
             responseBody,
-            ChunkedLoggingStreamTests.getDecodedLoggedBody(
+            ChunkedLoggingStreamTestUtils.getDecodedLoggedBody(
                 LogManager.getLogger(HttpTracerTests.HTTP_BODY_TRACER_LOGGER),
                 Level.TRACE,
                 "[" + request.getRequestId() + "] response body",
@@ -750,12 +742,7 @@ public class DefaultRestChannelTests extends ESTestCase {
                     public String getResponseContentTypeString() {
                         return RestResponse.TEXT_CONTENT_TYPE;
                     }
-
-                    @Override
-                    public void close() {
-                        assertTrue(isClosed.compareAndSet(false, true));
-                    }
-                }))
+                }, () -> assertTrue(isClosed.compareAndSet(false, true))))
             )
         );
 

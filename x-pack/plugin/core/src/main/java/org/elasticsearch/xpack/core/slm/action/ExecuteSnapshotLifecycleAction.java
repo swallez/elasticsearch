@@ -28,7 +28,7 @@ public class ExecuteSnapshotLifecycleAction extends ActionType<ExecuteSnapshotLi
     public static final String NAME = "cluster:admin/slm/execute";
 
     protected ExecuteSnapshotLifecycleAction() {
-        super(NAME, ExecuteSnapshotLifecycleAction.Response::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<Request> implements ToXContentObject {
@@ -36,6 +36,7 @@ public class ExecuteSnapshotLifecycleAction extends ActionType<ExecuteSnapshotLi
         private String lifecycleId;
 
         public Request(String lifecycleId) {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
             this.lifecycleId = lifecycleId;
         }
 
@@ -44,7 +45,9 @@ public class ExecuteSnapshotLifecycleAction extends ActionType<ExecuteSnapshotLi
             lifecycleId = in.readString();
         }
 
-        public Request() {}
+        public Request() {
+            super(TRAPPY_IMPLICIT_DEFAULT_MASTER_NODE_TIMEOUT, DEFAULT_ACK_TIMEOUT);
+        }
 
         public String getLifecycleId() {
             return this.lifecycleId;
