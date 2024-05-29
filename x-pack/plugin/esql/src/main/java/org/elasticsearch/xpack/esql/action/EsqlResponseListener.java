@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
@@ -138,13 +139,14 @@ public final class EsqlResponseListener extends RestRefCountedChunkedToXContentL
                     releasable
                 );
             } else if (mediaType == ArrowFormat.INSTANCE) {
+                ChunkedRestResponseBody.FromMany arrowResponse = new ArrowResponse(
+                    esqlResponse.columns().stream().map(c -> new ArrowResponse.Column(c.type(), c.name())).toList(),
+                    esqlResponse.pages()
+                ).chunkedResponse();
                 restResponse = RestResponse.chunked(
                     RestStatus.OK,
-                    new ArrowResponse(
-                        esqlResponse.columns().stream().map(c -> new ArrowResponse.Column(c.type(), c.name())).toList(),
-                        esqlResponse.pages(),
-                        esqlResponse::close
-                    ).chunkedResponse()
+                    arrowResponse,
+                    Releasables.wrap(arrowResponse, esqlResponse)
                 );
             } else {
                 restResponse = RestResponse.chunked(

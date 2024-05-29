@@ -10,8 +10,6 @@ package org.elasticsearch.xpack.esql.arrow;
 import com.carrotsearch.randomizedtesting.annotations.Name;
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
-import com.carrotsearch.randomizedtesting.annotations.Seed;
-
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -42,6 +40,7 @@ import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.rest.ChunkedRestResponseBody;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.transport.BytesRefRecycler;
+import org.junit.After;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -63,34 +62,34 @@ public class ArrowResponseTests extends ESTestCase {
         List<ArrowResponse.Column> justDate = List.of(new ArrowResponse.Column("date", "a"));
         List<ArrowResponse.Column> justKeyword = List.of(new ArrowResponse.Column("keyword", "a"));
 
-        List<TestCase> cases = new ArrayList<>();
+        List<ArrowTestCase> cases = new ArrayList<>();
 
-        cases.add(new TestCase("integer no pages", justInt, () -> List.of()));
-        TestCase.cases(cases, "integer all zeros", justInt, () -> new Page(intVector(10, i -> 0).asBlock()));
-        TestCase.cases(cases, "integer increment", justInt, () -> new Page(intVector(10, i -> i).asBlock()));
+        cases.add(new ArrowTestCase("integer no pages", justInt, () -> List.of()));
+        ArrowTestCase.cases(cases, "integer all zeros", justInt, () -> new Page(intVector(10, i -> 0).asBlock()));
+        ArrowTestCase.cases(cases, "integer increment", justInt, () -> new Page(intVector(10, i -> i).asBlock()));
 
-        cases.add(new TestCase("long no pages", justLong, () -> List.of()));
-        TestCase.cases(cases, "long all zeros", justLong, () -> new Page(longVector(10, i -> 0L).asBlock()));
-        TestCase.cases(cases, "long increment", justLong, () -> new Page(longVector(10, i -> i).asBlock()));
+        cases.add(new ArrowTestCase("long no pages", justLong, () -> List.of()));
+        ArrowTestCase.cases(cases, "long all zeros", justLong, () -> new Page(longVector(10, i -> 0L).asBlock()));
+        ArrowTestCase.cases(cases, "long increment", justLong, () -> new Page(longVector(10, i -> i).asBlock()));
 
-        cases.add(new TestCase("double no pages", justDouble, () -> List.of()));
-        TestCase.cases(cases, "double all zeros", justDouble, () -> new Page(doubleVector(10, i -> 0L).asBlock()));
-        TestCase.cases(cases, "double increment", justDouble, () -> new Page(doubleVector(10, i -> i).asBlock()));
+        cases.add(new ArrowTestCase("double no pages", justDouble, () -> List.of()));
+        ArrowTestCase.cases(cases, "double all zeros", justDouble, () -> new Page(doubleVector(10, i -> 0L).asBlock()));
+        ArrowTestCase.cases(cases, "double increment", justDouble, () -> new Page(doubleVector(10, i -> i).asBlock()));
 
-        cases.add(new TestCase("date no pages", justDate, () -> List.of()));
-        TestCase.cases(cases, "date all zeros", justDate, () -> new Page(longVector(10, i -> 0L).asBlock()));
-        TestCase.cases(cases, "date increment", justDate, () -> new Page(longVector(10, i -> i).asBlock()));
+        cases.add(new ArrowTestCase("date no pages", justDate, () -> List.of()));
+        ArrowTestCase.cases(cases, "date all zeros", justDate, () -> new Page(longVector(10, i -> 0L).asBlock()));
+        ArrowTestCase.cases(cases, "date increment", justDate, () -> new Page(longVector(10, i -> i).asBlock()));
 
-        cases.add(new TestCase("keyword no pages", justKeyword, () -> List.of()));
-        TestCase.cases(
+        cases.add(new ArrowTestCase("keyword no pages", justKeyword, () -> List.of()));
+        ArrowTestCase.cases(
             cases,
             "keyword empty",
             justKeyword,
             () -> new Page(bytesRefVector(10, i -> new BytesRef(BytesRef.EMPTY_BYTES, 0, 0)).asBlock())
         );
-        TestCase.cases(cases, "keyword \"a\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("a")).asBlock()));
-        TestCase.cases(cases, "keyword \"foo\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("foo")).asBlock()));
-        TestCase.cases(
+        ArrowTestCase.cases(cases, "keyword \"a\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("a")).asBlock()));
+        ArrowTestCase.cases(cases, "keyword \"foo\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("foo")).asBlock()));
+        ArrowTestCase.cases(
             cases,
             "keyword \"foo\"|\"bar\"",
             justKeyword,
@@ -98,7 +97,7 @@ public class ArrowResponseTests extends ESTestCase {
         );
 
         for (Map.Entry<String, IntFunction<Block>> first : RANDOM.entrySet()) {
-            TestCase.cases(
+            ArrowTestCase.cases(
                 cases,
                 first.getKey(),
                 List.of(new ArrowResponse.Column(first.getKey(), "a")),
@@ -106,7 +105,7 @@ public class ArrowResponseTests extends ESTestCase {
             );
 
             for (Map.Entry<String, IntFunction<Block>> second : RANDOM.entrySet()) {
-                TestCase.cases(
+                ArrowTestCase.cases(
                     cases,
                     first.getKey() + "|" + second.getKey(),
                     List.of(new ArrowResponse.Column(first.getKey(), "a"), new ArrowResponse.Column(second.getKey(), "b")),
@@ -117,7 +116,7 @@ public class ArrowResponseTests extends ESTestCase {
                 );
 
                 for (Map.Entry<String, IntFunction<Block>> third : RANDOM.entrySet()) {
-                    TestCase.cases(
+                    ArrowTestCase.cases(
                         cases,
                         first.getKey() + "|" + second.getKey() + "|" + third.getKey(),
                         List.of(
@@ -138,7 +137,7 @@ public class ArrowResponseTests extends ESTestCase {
             }
         }
 
-        return () -> Iterators.map(cases.iterator(), c -> new Object[] { c });
+        return () -> cases.stream().map(c -> new Object[] { c }).iterator();
     }
 
     private static final Map<String, IntFunction<Block>> RANDOM = Map.ofEntries(
@@ -149,9 +148,9 @@ public class ArrowResponseTests extends ESTestCase {
         Map.entry("keyword", ArrowResponseTests::fullyRandomKeywordVector)
     );
 
-    private final TestCase testCase;
+    private final ArrowTestCase testCase;
 
-    public ArrowResponseTests(@Name("desc") TestCase testCase) {
+    public ArrowResponseTests(@Name("desc") ArrowTestCase testCase) {
         this.testCase = testCase;
     }
 
@@ -163,6 +162,11 @@ public class ArrowResponseTests extends ESTestCase {
     public void test() throws IOException {
         BytesReference directBlocks = serializeBlocksDirectly();
         BytesReference nativeArrow = serializeWithNativeArrow();
+
+        for (Page page: this.testCase.response.pages()) {
+            page.releaseBlocks();
+            page.toString();
+        }
 
         int length = Math.max(directBlocks.length(), nativeArrow.length());
         for (int i = 0; i < length; i++) {
@@ -355,39 +359,38 @@ public class ArrowResponseTests extends ESTestCase {
         BigArrays.NON_RECYCLING_INSTANCE
     );
 
-    private static class TestCase {
+    private static class ArrowTestCase {
         private final String description;
         private final List<ArrowResponse.Column> columns;
         private final Supplier<List<Page>> pages;
         private ArrowResponse response;
 
-        static void cases(List<TestCase> cases, String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
+        static void cases(List<ArrowTestCase> cases, String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
             cases.add(onePage(description, columns, page));
             cases.add(twoPages(description, columns, page));
             cases.add(randomPages(description, columns, page));
         }
 
-        static TestCase onePage(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new TestCase(description + " one page", columns, () -> List.of(page.get()));
+        static ArrowTestCase onePage(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
+            return new ArrowTestCase(description + " one page", columns, () -> List.of(page.get()));
         }
 
-        static TestCase twoPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new TestCase(description + " two pages", columns, () -> List.of(page.get(), page.get()));
+        static ArrowTestCase twoPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
+            return new ArrowTestCase(description + " two pages", columns, () -> List.of(page.get(), page.get()));
         }
 
-        static TestCase randomPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new TestCase(description + " random pages", columns, () -> {
+        static ArrowTestCase randomPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
+            return new ArrowTestCase(description + " random pages", columns, () -> {
                 int pageCount = between(0, 100);
                 List<Page> pages = new ArrayList<>(pageCount);
                 for (int p = 0; p < pageCount; p++) {
-                    int positions = between(1, 10_000);
                     pages.add(page.get());
                 }
                 return pages;
             });
         }
 
-        private TestCase(String description, List<ArrowResponse.Column> columns, Supplier<List<Page>> pages) {
+        private ArrowTestCase(String description, List<ArrowResponse.Column> columns, Supplier<List<Page>> pages) {
             this.description = description;
             this.columns = columns;
             this.pages = pages;
@@ -395,7 +398,7 @@ public class ArrowResponseTests extends ESTestCase {
 
         ArrowResponse response() {
             if (response == null) {
-                response = new ArrowResponse(columns, pages.get(), () -> {});
+                response = new ArrowResponse(columns, pages.get());
             }
             return response;
         }

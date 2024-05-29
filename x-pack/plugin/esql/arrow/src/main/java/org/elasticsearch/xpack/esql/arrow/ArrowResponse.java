@@ -22,6 +22,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.bytes.ReleasableBytesReference;
+import org.elasticsearch.common.io.stream.BytesStream;
 import org.elasticsearch.common.io.stream.RecyclerBytesStreamOutput;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.compute.data.Block;
@@ -34,8 +35,6 @@ import org.elasticsearch.compute.data.IntVector;
 import org.elasticsearch.compute.data.LongBlock;
 import org.elasticsearch.compute.data.LongVector;
 import org.elasticsearch.compute.data.Page;
-import org.elasticsearch.compute.data.Vector;
-import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.rest.ChunkedRestResponseBody;
 import org.elasticsearch.xpack.esql.arrow.shim.Shim;
@@ -46,7 +45,8 @@ import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.List;
 
-public class ArrowResponse implements Releasable {
+public class ArrowResponse {
+
     public static class Column {
         private final String esqlType;
         private final FieldType arrowType;
@@ -69,12 +69,10 @@ public class ArrowResponse implements Releasable {
 
     private final List<Column> columns;
     private final List<Page> pages;
-    private final Runnable closeMe;
 
-    public ArrowResponse(List<Column> columns, List<Page> pages, Runnable closeMe) {
+    public ArrowResponse(List<Column> columns, List<Page> pages) {
         this.columns = columns;
         this.pages = pages;
-        this.closeMe = closeMe;
     }
 
     List<Column> columns() {
@@ -85,12 +83,7 @@ public class ArrowResponse implements Releasable {
         return pages;
     }
 
-    @Override
-    public void close() {
-        closeMe.run();
-    }
-
-    public ChunkedRestResponseBody chunkedResponse() {
+    public ChunkedRestResponseBody.FromMany chunkedResponse() {
         // TODO dictionaries
 
         SchemaResponse schemaResponse = new SchemaResponse(this);
@@ -116,9 +109,6 @@ public class ArrowResponse implements Releasable {
         }
 
         @Override
-        public void close() {}
-
-        @Override
         public final ReleasableBytesReference encodeChunk(int sizeHint, Recycler<BytesRef> recycler) throws IOException {
             RecyclerBytesStreamOutput output = new RecyclerBytesStreamOutput(recycler);
             try {
@@ -126,7 +116,11 @@ public class ArrowResponse implements Releasable {
                 BytesReference ref = output.bytes();
                 RecyclerBytesStreamOutput closeRef = output;
                 output = null;
-                ReleasableBytesReference result = new ReleasableBytesReference(ref, () -> Releasables.closeExpectNoException(closeRef));
+                ReleasableBytesReference result = new ReleasableBytesReference(ref,
+                    () -> {
+                        Releasables.closeExpectNoException(closeRef);
+                    }
+                );
                 return result;
             } catch (Exception e) {
                 logger.error("failed to write arrow chunk", e);
@@ -142,10 +136,9 @@ public class ArrowResponse implements Releasable {
         protected abstract void encodeChunk(int sizeHint, RecyclerBytesStreamOutput out) throws IOException;
 
         /**
-         * Adapts our {@link RecyclerBytesStreamOutput} to the format that Arrow
-         * likes to write to.
+         * Adapts a {@link BytesStream} so that Arrow can write to it.
          */
-        protected static WritableByteChannel arrowOut(RecyclerBytesStreamOutput output) {
+        protected static WritableByteChannel arrowOut(BytesStream output) {
             return new WritableByteChannel() {
                 @Override
                 public int write(ByteBuffer byteBuffer) throws IOException {
@@ -175,6 +168,11 @@ public class ArrowResponse implements Releasable {
         }
     }
 
+    /**
+     * Header part of the Arrow response containing the dataframe schema.
+     *
+     * @see <a href="https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format">IPC Streaming Format</a>
+     */
     private static class SchemaResponse extends AbstractArrowChunkedResponse {
         private boolean done = false;
 
@@ -199,6 +197,9 @@ public class ArrowResponse implements Releasable {
         }
     }
 
+    /**
+     * Write an ES|QL page as an Arrow RecordBatch
+     */
     private static class PageResponse extends AbstractArrowChunkedResponse {
         private final Page page;
         private boolean done = false;
@@ -213,22 +214,40 @@ public class ArrowResponse implements Releasable {
             return done;
         }
 
-        interface WriteBuf {
+        // Writes some data and returns the number of bytes written.
+        interface BufWriter {
             long write() throws IOException;
         }
 
         @Override
         protected void encodeChunk(int sizeHint, RecyclerBytesStreamOutput out) throws IOException {
+            // An Arrow record batch consists of:
+            // - fields metadata, giving the number of items and the number of null values for each field
+            // - data buffers for each field. The number of buffers for a field depends on its type, e.g.:
+            //   - for primitive types, there's a validity buffer (for nulls) and a value buffer.
+            //   - for strings, there's a validity buffer, an offsets buffer and a data buffer
+            //
+            // See https://arrow.apache.org/docs/format/Columnar.html#recordbatch-message
+
+            // Field metadata
             List<ArrowFieldNode> nodes = new ArrayList<>(page.getBlockCount());
-            List<WriteBuf> writeBufs = new ArrayList<>(page.getBlockCount() * 2);
+
+            // Buffers added to the record batch. They're used to track data size so that Arrow can compute offsets
+            // but contain no data. Actual writing will be done by the bufWriters. This avoids having to deal with
+            // Arrow's memory management, and in the future will allow direct write from ESQL block vectors.
             List<ArrowBuf> bufs = new ArrayList<>(page.getBlockCount() * 2);
+
+            // Closures that will actually write a Block's data. Maps 1:1 to `bufs`.
+            List<BufWriter> bufWriters = new ArrayList<>(page.getBlockCount() * 2);
+
+            // Give Arrow a WriteChannel that will iterate on `bufWriters` when requested to write a buffer.
             WriteChannel arrowOut = new WriteChannel(arrowOut(out)) {
                 int bufIdx = 0;
                 long extraPosition = 0;
 
                 @Override
                 public void write(ArrowBuf buffer) throws IOException {
-                    extraPosition += writeBufs.get(bufIdx++).write();
+                    extraPosition += bufWriters.get(bufIdx++).write();
                 }
 
                 @Override
@@ -245,41 +264,61 @@ public class ArrowResponse implements Releasable {
                     return 0;
                 }
             };
+
+            // Create Arrow buffers for each of the blocks in this page
             for (int b = 0; b < page.getBlockCount(); b++) {
-                accumulateBlock(out, nodes, bufs, writeBufs, page.getBlock(b));
+                accumulateBlock(out, nodes, bufs, bufWriters, page.getBlock(b));
             }
+
+            // Create the batch and serialize it
             ArrowRecordBatch batch = new ArrowRecordBatch(
                 page.getPositionCount(),
                 nodes,
                 bufs,
                 NoCompressionCodec.DEFAULT_BODY_COMPRESSION,
-                true,
-                false
+                true, // align buffers
+                false // retain buffers
             );
             MessageSerializer.serialize(arrowOut, batch);
+
             done = true; // one day we should respect sizeHint here. kindness.
         }
 
-        private static int validityCount(int totalValues) {
+        // Length in bytes of a validity buffer
+        private static int validityLength(int totalValues) {
             return (totalValues - 1) / Byte.SIZE + 1;
+        }
+
+        // Block.nullValuesCount was more efficient but was removed in https://github.com/elastic/elasticsearch/pull/108916
+        private int nullValuesCount(Block block) {
+            if (block.mayHaveNulls() == false) {
+                return 0;
+            }
+            int count = 0;
+            for (int i = 0; i < block.getPositionCount(); i++) {
+                if (block.isNull(i)) {
+                    count++;
+                }
+            }
+            return count;
         }
 
         private void accumulateBlock(
             RecyclerBytesStreamOutput out,
             List<ArrowFieldNode> nodes,
             List<ArrowBuf> bufs,
-            List<WriteBuf> writeBufs,
+            List<BufWriter> bufWriters,
             Block block
         ) {
-            nodes.add(new ArrowFieldNode(block.getPositionCount(), block.nullValuesCount()));
+            nodes.add(new ArrowFieldNode(block.getPositionCount(), nullValuesCount(block)));
             switch (block.elementType()) {
                 case DOUBLE -> {
                     DoubleBlock b = (DoubleBlock) block;
                     DoubleVector v = b.asVector();
                     if (v != null) {
-                        accumulateVectorValidity(out, bufs, writeBufs, v);
-                        bufs.add(dummy().writerIndex(vectorLength(v)));
-                        writeBufs.add(() -> writeVector(out, v));
+                        accumulateVectorValidity(out, bufs, bufWriters, b);
+                        bufs.add(dummyArrowBuf(vectorLength(v)));
+                        bufWriters.add(() -> writeVector(out, v));
                         return;
                     }
                     throw new UnsupportedOperationException();
@@ -288,20 +327,21 @@ public class ArrowResponse implements Releasable {
                     IntBlock b = (IntBlock) block;
                     IntVector v = b.asVector();
                     if (v != null) {
-                        accumulateVectorValidity(out, bufs, writeBufs, v);
-                        bufs.add(dummy().writerIndex(vectorLength(v)));
-                        writeBufs.add(() -> writeVector(out, v));
+                        accumulateVectorValidity(out, bufs, bufWriters, b);
+                        bufs.add(dummyArrowBuf(vectorLength(v)));
+                        bufWriters.add(() -> writeVector(out, v));
                         return;
                     }
                     throw new UnsupportedOperationException();
                 }
                 case LONG -> {
                     LongBlock b = (LongBlock) block;
+
                     LongVector v = b.asVector();
                     if (v != null) {
-                        accumulateVectorValidity(out, bufs, writeBufs, v);
-                        bufs.add(dummy().writerIndex(vectorLength(v)));
-                        writeBufs.add(() -> writeVector(out, v));
+                        accumulateVectorValidity(out, bufs, bufWriters, b);
+                        bufs.add(dummyArrowBuf(vectorLength(v)));
+                        bufWriters.add(() -> writeVector(out, v));
                         return;
                     }
                     throw new UnsupportedOperationException();
@@ -310,22 +350,24 @@ public class ArrowResponse implements Releasable {
                     BytesRefBlock b = (BytesRefBlock) block;
                     BytesRefVector v = b.asVector();
                     if (v != null) {
-                        accumulateVectorValidity(out, bufs, writeBufs, v);
-                        bufs.add(dummy().writerIndex(vectorOffsetLength(v)));
-                        writeBufs.add(() -> writeVectorOffset(out, v));
-                        bufs.add(dummy().writerIndex(vectorLength(v)));
-                        writeBufs.add(() -> writeVector(out, v));
+                        accumulateVectorValidity(out, bufs, bufWriters, b);
+                        bufs.add(dummyArrowBuf(vectorOffsetLength(v)));
+                        bufWriters.add(() -> writeVectorOffset(out, v));
+                        bufs.add(dummyArrowBuf(vectorLength(v)));
+                        bufWriters.add(() -> writeVector(out, v));
                         return;
                     }
                     throw new UnsupportedOperationException();
                 }
-                default -> throw new UnsupportedOperationException();
+                default -> {
+                    throw new UnsupportedOperationException("ES|QL block type [" + block.elementType() + "] not supported by Arrow format");
+                }
             }
         }
 
-        private void accumulateVectorValidity(RecyclerBytesStreamOutput out, List<ArrowBuf> bufs, List<WriteBuf> writeBufs, Vector v) {
-            bufs.add(dummy().writerIndex(validityCount(v.getPositionCount())));
-            writeBufs.add(() -> writeAllTrueValidity(out, v.getPositionCount()));
+        private void accumulateVectorValidity(RecyclerBytesStreamOutput out, List<ArrowBuf> bufs, List<BufWriter> bufWriters, Block b) {
+            bufs.add(dummyArrowBuf(validityLength(b.getPositionCount())));
+            bufWriters.add(() -> writeAllTrueValidity(out, b.getPositionCount()));
         }
 
         private long writeAllTrueValidity(RecyclerBytesStreamOutput out, int valueCount) {
@@ -415,8 +457,9 @@ public class ArrowResponse implements Releasable {
             return length;
         }
 
-        private ArrowBuf dummy() {
-            return new ArrowBuf(null, null, 0, 0);
+        // Create a dummy ArrowBuf used for size accounting purposes.
+        private ArrowBuf dummyArrowBuf(long size) {
+            return new ArrowBuf(null, null, 0, 0).writerIndex(size);
         }
     }
 
@@ -437,11 +480,6 @@ public class ArrowResponse implements Releasable {
             ArrowStreamWriter.writeEndOfStream(new WriteChannel(arrowOut(out)), IpcOption.DEFAULT);
             done = true;
         }
-
-        @Override
-        public void close() {
-            Releasables.closeExpectNoException(response);
-        }
     }
 
     static FieldType arrowFieldType(String fieldType) {
@@ -451,7 +489,7 @@ public class ArrowResponse implements Releasable {
             case "integer" -> FieldType.nullable(Types.MinorType.INT.getType());
             case "long" -> FieldType.nullable(Types.MinorType.BIGINT.getType());
             case "keyword", "text" -> FieldType.nullable(Types.MinorType.VARCHAR.getType());
-            default -> throw new UnsupportedOperationException("NOCOMMIT " + fieldType);
+            default -> throw new UnsupportedOperationException("Field type [" + fieldType + "] not supported by Arrow format");
         };
     }
 }
