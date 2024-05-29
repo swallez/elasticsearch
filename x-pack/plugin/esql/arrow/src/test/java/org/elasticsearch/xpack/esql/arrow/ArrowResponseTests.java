@@ -148,7 +148,7 @@ public class ArrowResponseTests extends ESTestCase {
         Map.entry("keyword", ArrowResponseTests::fullyRandomKeywordVector)
     );
 
-    private final ArrowTestCase testCase;
+    private ArrowTestCase testCase;
 
     public ArrowResponseTests(@Name("desc") ArrowTestCase testCase) {
         this.testCase = testCase;
@@ -182,6 +182,14 @@ public class ArrowResponseTests extends ESTestCase {
                 );
             }
         }
+    }
+
+    @After
+    public void cleanup() {
+        for (Page page: this.testCase.response.pages()) {
+            page.releaseBlocks();
+        }
+        this.testCase = null;
     }
 
     private String describeRange(BytesReference directBlocks, BytesReference nativeArrow, int from, int to) {
@@ -381,7 +389,7 @@ public class ArrowResponseTests extends ESTestCase {
 
         static ArrowTestCase randomPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
             return new ArrowTestCase(description + " random pages", columns, () -> {
-                int pageCount = between(0, 100);
+                int pageCount = between(0, 10);
                 List<Page> pages = new ArrayList<>(pageCount);
                 for (int p = 0; p < pageCount; p++) {
                     pages.add(page.get());

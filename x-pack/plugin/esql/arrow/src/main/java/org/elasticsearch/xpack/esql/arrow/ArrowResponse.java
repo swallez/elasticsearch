@@ -116,11 +116,7 @@ public class ArrowResponse {
                 BytesReference ref = output.bytes();
                 RecyclerBytesStreamOutput closeRef = output;
                 output = null;
-                ReleasableBytesReference result = new ReleasableBytesReference(ref,
-                    () -> {
-                        Releasables.closeExpectNoException(closeRef);
-                    }
-                );
+                ReleasableBytesReference result = new ReleasableBytesReference(ref, () -> Releasables.closeExpectNoException(closeRef));
                 return result;
             } catch (Exception e) {
                 logger.error("failed to write arrow chunk", e);
