@@ -4,6 +4,7 @@ dependencies {
   implementation project('shim')
   compileOnly project(':server')
   compileOnly project(':x-pack:plugin:esql:compute')
+  compileOnly project(':x-pack:plugin:mapper-version')
   implementation('org.apache.arrow:arrow-vector:15.0.0')
   implementation('org.apache.arrow:arrow-format:15.0.0')
   implementation('org.apache.arrow:arrow-memory-core:15.0.0')

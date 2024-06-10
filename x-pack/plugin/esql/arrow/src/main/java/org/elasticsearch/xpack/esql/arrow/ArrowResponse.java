@@ -15,9 +15,8 @@ import org.apache.arrow.vector.ipc.message.ArrowFieldNode;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
-import org.apache.arrow.vector.types.Types;
+import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.bytes.BytesReference;
@@ -26,14 +25,6 @@ import org.elasticsearch.common.io.stream.BytesStream;
 import org.elasticsearch.common.io.stream.RecyclerBytesStreamOutput;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.compute.data.Block;
-import org.elasticsearch.compute.data.BytesRefBlock;
-import org.elasticsearch.compute.data.BytesRefVector;
-import org.elasticsearch.compute.data.DoubleBlock;
-import org.elasticsearch.compute.data.DoubleVector;
-import org.elasticsearch.compute.data.IntBlock;
-import org.elasticsearch.compute.data.IntVector;
-import org.elasticsearch.compute.data.LongBlock;
-import org.elasticsearch.compute.data.LongVector;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.rest.ChunkedRestResponseBody;
@@ -44,17 +35,21 @@ import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 public class ArrowResponse {
 
     public static class Column {
         private final String esqlType;
-        private final FieldType arrowType;
+        private final BlockConverter converter;
         private final String name;
 
         public Column(String esqlType, String name) {
             this.esqlType = esqlType;
-            this.arrowType = arrowFieldType(esqlType);
+            this.converter = ESQL_CONVERTERS.get(esqlType);
+            if (converter == null) {
+                throw new IllegalArgumentException("ES|QL type [" + esqlType + "] is not supported by the Arrow format");
+            }
             this.name = name;
         }
 
@@ -63,7 +58,7 @@ public class ArrowResponse {
         }
 
         Field arrowField() {
-            return new Field(name, arrowType, List.of());
+            return new Field(name, converter.arrowFieldType(), List.of());
         }
     }
 
@@ -222,7 +217,6 @@ public class ArrowResponse {
             // - data buffers for each field. The number of buffers for a field depends on its type, e.g.:
             //   - for primitive types, there's a validity buffer (for nulls) and a value buffer.
             //   - for strings, there's a validity buffer, an offsets buffer and a data buffer
-            //
             // See https://arrow.apache.org/docs/format/Columnar.html#recordbatch-message
 
             // Field metadata
@@ -234,7 +228,7 @@ public class ArrowResponse {
             List<ArrowBuf> bufs = new ArrayList<>(page.getBlockCount() * 2);
 
             // Closures that will actually write a Block's data. Maps 1:1 to `bufs`.
-            List<BufWriter> bufWriters = new ArrayList<>(page.getBlockCount() * 2);
+            List<BlockConverter.BufWriter> bufWriters = new ArrayList<>(page.getBlockCount() * 2);
 
             // Give Arrow a WriteChannel that will iterate on `bufWriters` when requested to write a buffer.
             WriteChannel arrowOut = new WriteChannel(arrowOut(out)) {
@@ -243,7 +237,7 @@ public class ArrowResponse {
 
                 @Override
                 public void write(ArrowBuf buffer) throws IOException {
-                    extraPosition += bufWriters.get(bufIdx++).write();
+                    extraPosition += bufWriters.get(bufIdx++).write(out);
                 }
 
                 @Override
@@ -263,7 +257,11 @@ public class ArrowResponse {
 
             // Create Arrow buffers for each of the blocks in this page
             for (int b = 0; b < page.getBlockCount(); b++) {
-                accumulateBlock(out, nodes, bufs, bufWriters, page.getBlock(b));
+                var converter = response.columns.get(b).converter;
+
+                Block block = page.getBlock(b);
+                nodes.add(new ArrowFieldNode(block.getPositionCount(), converter.nullValuesCount(block)));
+                converter.convert(block, bufs, bufWriters);
             }
 
             // Create the batch and serialize it
@@ -279,187 +277,9 @@ public class ArrowResponse {
 
             done = true; // one day we should respect sizeHint here. kindness.
         }
-
-        // Length in bytes of a validity buffer
-        private static int validityLength(int totalValues) {
-            return (totalValues - 1) / Byte.SIZE + 1;
-        }
-
-        // Block.nullValuesCount was more efficient but was removed in https://github.com/elastic/elasticsearch/pull/108916
-        private int nullValuesCount(Block block) {
-            if (block.mayHaveNulls() == false) {
-                return 0;
-            }
-            int count = 0;
-            for (int i = 0; i < block.getPositionCount(); i++) {
-                if (block.isNull(i)) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
-        private void accumulateBlock(
-            RecyclerBytesStreamOutput out,
-            List<ArrowFieldNode> nodes,
-            List<ArrowBuf> bufs,
-            List<BufWriter> bufWriters,
-            Block block
-        ) {
-            nodes.add(new ArrowFieldNode(block.getPositionCount(), nullValuesCount(block)));
-            switch (block.elementType()) {
-                case DOUBLE -> {
-                    DoubleBlock b = (DoubleBlock) block;
-                    DoubleVector v = b.asVector();
-                    if (v != null) {
-                        accumulateVectorValidity(out, bufs, bufWriters, b);
-                        bufs.add(dummyArrowBuf(vectorLength(v)));
-                        bufWriters.add(() -> writeVector(out, v));
-                        return;
-                    }
-                    throw new UnsupportedOperationException();
-                }
-                case INT -> {
-                    IntBlock b = (IntBlock) block;
-                    IntVector v = b.asVector();
-                    if (v != null) {
-                        accumulateVectorValidity(out, bufs, bufWriters, b);
-                        bufs.add(dummyArrowBuf(vectorLength(v)));
-                        bufWriters.add(() -> writeVector(out, v));
-                        return;
-                    }
-                    throw new UnsupportedOperationException();
-                }
-                case LONG -> {
-                    LongBlock b = (LongBlock) block;
-
-                    LongVector v = b.asVector();
-                    if (v != null) {
-                        accumulateVectorValidity(out, bufs, bufWriters, b);
-                        bufs.add(dummyArrowBuf(vectorLength(v)));
-                        bufWriters.add(() -> writeVector(out, v));
-                        return;
-                    }
-                    throw new UnsupportedOperationException();
-                }
-                case BYTES_REF -> {
-                    BytesRefBlock b = (BytesRefBlock) block;
-                    BytesRefVector v = b.asVector();
-                    if (v != null) {
-                        accumulateVectorValidity(out, bufs, bufWriters, b);
-                        bufs.add(dummyArrowBuf(vectorOffsetLength(v)));
-                        bufWriters.add(() -> writeVectorOffset(out, v));
-                        bufs.add(dummyArrowBuf(vectorLength(v)));
-                        bufWriters.add(() -> writeVector(out, v));
-                        return;
-                    }
-                    throw new UnsupportedOperationException();
-                }
-                default -> {
-                    throw new UnsupportedOperationException("ES|QL block type [" + block.elementType() + "] not supported by Arrow format");
-                }
-            }
-        }
-
-        private void accumulateVectorValidity(RecyclerBytesStreamOutput out, List<ArrowBuf> bufs, List<BufWriter> bufWriters, Block b) {
-            bufs.add(dummyArrowBuf(validityLength(b.getPositionCount())));
-            bufWriters.add(() -> writeAllTrueValidity(out, b.getPositionCount()));
-        }
-
-        private long writeAllTrueValidity(RecyclerBytesStreamOutput out, int valueCount) {
-            int allOnesCount = valueCount / 8;
-            for (int i = 0; i < allOnesCount; i++) {
-                out.writeByte((byte) 0xff);
-            }
-            int remaining = valueCount % 8;
-            if (remaining == 0) {
-                return allOnesCount;
-            }
-            out.writeByte((byte) ((1 << remaining) - 1));
-            return allOnesCount + 1;
-        }
-
-        private long vectorLength(IntVector vector) {
-            return Integer.BYTES * vector.getPositionCount();
-        }
-
-        private long writeVector(RecyclerBytesStreamOutput out, IntVector vector) throws IOException {
-            // TODO could we "just" get the memory of the array and dump it?
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                out.writeIntLE(vector.getInt(i));
-            }
-            return vectorLength(vector);
-        }
-
-        private long vectorLength(LongVector vector) {
-            return Long.BYTES * vector.getPositionCount();
-        }
-
-        private long writeVector(RecyclerBytesStreamOutput out, LongVector vector) throws IOException {
-            // TODO could we "just" get the memory of the array and dump it?
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                out.writeLongLE(vector.getLong(i));
-            }
-            return vectorLength(vector);
-        }
-
-        private long vectorLength(DoubleVector vector) {
-            return Double.BYTES * vector.getPositionCount();
-        }
-
-        private long writeVector(RecyclerBytesStreamOutput out, DoubleVector vector) throws IOException {
-            // TODO could we "just" get the memory of the array and dump it?
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                out.writeDoubleLE(vector.getDouble(i));
-            }
-            return vectorLength(vector);
-        }
-
-        private long vectorOffsetLength(BytesRefVector vector) {
-            return Integer.BYTES * (vector.getPositionCount() + 1);
-        }
-
-        private long writeVectorOffset(RecyclerBytesStreamOutput out, BytesRefVector vector) throws IOException {
-            // TODO could we "just" get the memory of the array and dump it?
-            BytesRef scratch = new BytesRef();
-            int offset = 0;
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                out.writeIntLE(offset);
-                offset += vector.getBytesRef(i, scratch).length;
-            }
-            out.writeIntLE(offset);
-            return vectorOffsetLength(vector);
-        }
-
-        private long vectorLength(BytesRefVector vector) {
-            // TODO we can probably get the length from the vector without all this sum - it's in an array
-            long length = 0;
-            BytesRef scratch = new BytesRef();
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                length += vector.getBytesRef(i, scratch).length;
-            }
-            return length;
-        }
-
-        private long writeVector(RecyclerBytesStreamOutput out, BytesRefVector vector) throws IOException {
-            // TODO could we "just" get the memory of the array and dump it?
-            BytesRef scratch = new BytesRef();
-            long length = 0;
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                BytesRef v = vector.getBytesRef(i, scratch);
-                out.write(v.bytes, v.offset, v.length);
-                length += v.length;
-            }
-            return length;
-        }
-
-        // Create a dummy ArrowBuf used for size accounting purposes.
-        private ArrowBuf dummyArrowBuf(long size) {
-            return new ArrowBuf(null, null, 0, 0).writerIndex(size);
-        }
     }
 
-    private class EndResponse extends AbstractArrowChunkedResponse {
+    private static class EndResponse extends AbstractArrowChunkedResponse {
         private boolean done = false;
 
         private EndResponse(ArrowResponse response) {
@@ -478,14 +298,56 @@ public class ArrowResponse {
         }
     }
 
-    static FieldType arrowFieldType(String fieldType) {
-        return switch (fieldType) {
-            case "date" -> FieldType.nullable(Types.MinorType.DATEMILLI.getType());
-            case "double" -> FieldType.nullable(Types.MinorType.FLOAT8.getType());
-            case "integer" -> FieldType.nullable(Types.MinorType.INT.getType());
-            case "long" -> FieldType.nullable(Types.MinorType.BIGINT.getType());
-            case "keyword", "text" -> FieldType.nullable(Types.MinorType.VARCHAR.getType());
-            default -> throw new UnsupportedOperationException("Field type [" + fieldType + "] not supported by Arrow format");
-        };
+    /**
+     * Converters for every ES|QL type
+     */
+    private static final Map<String, BlockConverter> ESQL_CONVERTERS = Map.ofEntries(
+        // For reference, JSON conversions are in PositionToXContent
+        // Missing: multi-valued values
+
+        buildEntry(new BlockConverter.AsNull("null")),
+        buildEntry(new BlockConverter.AsNull("unsupported")),
+
+        buildEntry(new BlockConverter.AsBoolean("boolean")),
+
+        buildEntry(new BlockConverter.AsInt32("integer")),
+        buildEntry(new BlockConverter.AsInt32("counter_integer")),
+
+        buildEntry(new BlockConverter.AsInt64("long")),
+        // FIXME: counters: are they signed?
+        buildEntry(new BlockConverter.AsInt64("counter_long")),
+        buildEntry(new BlockConverter.AsInt64("unsigned_long", MinorType.UINT8)),
+
+        buildEntry(new BlockConverter.AsFloat64("double")),
+        buildEntry(new BlockConverter.AsFloat64("counter_double")),
+
+        buildEntry(new BlockConverter.AsVarChar("keyword")),
+        buildEntry(new BlockConverter.AsVarChar("text")),
+
+        // date: array of int64 seconds since epoch
+        // FIXME: is it signed?
+        buildEntry(new BlockConverter.AsInt64("date", MinorType.TIMESTAMPMILLI)),
+
+        // ip are represented as 16-byte ipv6 addresses. We shorten mapped ipv4 addresses to 4 bytes.
+        // Another option would be to use a fixed size binary to avoid the offset array. But with mostly
+        // ipv4 addresses it would still be twice as big.
+        buildEntry(new BlockConverter.TransformedBytesRef("ip", MinorType.VARBINARY, ValueConversions::shortenIpV4Addresses)),
+
+        // geo_point: Keep WKB format (JSON converts to WKT)
+        buildEntry(new BlockConverter.AsVarBinary("geo_point")),
+        buildEntry(new BlockConverter.AsVarBinary("geo_shape")),
+        buildEntry(new BlockConverter.AsVarBinary("cartesian_point")),
+        buildEntry(new BlockConverter.AsVarBinary("cartesian_shape")),
+
+        // version: convert to string
+        buildEntry(new BlockConverter.TransformedBytesRef("version", MinorType.VARCHAR, ValueConversions::versionToString)),
+
+        // _source: json
+        // TODO: support also CBOR and SMILE with an additional formatting parameter
+        buildEntry(new BlockConverter.TransformedBytesRef("_source", MinorType.VARCHAR, ValueConversions::sourceToJson))
+    );
+
+    private static Map.Entry<String, BlockConverter> buildEntry(BlockConverter converter) {
+        return Map.entry(converter.esqlType(), converter);
     }
 }
