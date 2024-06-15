@@ -15,6 +15,10 @@ import org.elasticsearch.xpack.versionfield.Version;
 
 import java.io.IOException;
 
+/**
+ * Utilities to convert some of byte-encoded ESQL values into to a format more suitable
+ * for Arrow output.
+ */
 public class ValueConversions {
 
     /**
@@ -35,16 +39,22 @@ public class ValueConversions {
                 scratch.bytes = value.bytes;
                 scratch.offset = value.offset + 12;
                 scratch.length = 4;
+                return scratch;
             }
-            return scratch;
         }
         return value;
     }
 
+    /**
+     * Convert binary-encoded versions to strings
+     */
     public static BytesRef versionToString(BytesRef value, BytesRef scratch) {
         return new BytesRef(new Version(value).toString());
     }
 
+    /**
+     * Convert any xcontent source to json
+     */
     public static BytesRef sourceToJson(BytesRef value, BytesRef scratch) {
         try {
             var valueArray = new BytesArray(value);

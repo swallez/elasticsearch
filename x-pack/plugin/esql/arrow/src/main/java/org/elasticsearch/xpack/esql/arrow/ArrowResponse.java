@@ -301,8 +301,11 @@ public class ArrowResponse {
     /**
      * Converters for every ES|QL type
      */
-    private static final Map<String, BlockConverter> ESQL_CONVERTERS = Map.ofEntries(
-        // For reference, JSON conversions are in PositionToXContent
+    static final Map<String, BlockConverter> ESQL_CONVERTERS = Map.ofEntries(
+        // For reference:
+        // - EsqlDataTypes: list of ESQL data types (not all are present in outputs)
+        // - PositionToXContent: conversions for ESQL JSON output
+        // - EsqlDataTypeConverter: conversions to ESQL datatypes
         // Missing: multi-valued values
 
         buildEntry(new BlockConverter.AsNull("null")),

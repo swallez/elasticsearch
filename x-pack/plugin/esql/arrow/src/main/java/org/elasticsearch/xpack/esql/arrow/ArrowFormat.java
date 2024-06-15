@@ -16,8 +16,9 @@ public class ArrowFormat implements MediaType {
     public static final ArrowFormat INSTANCE = new ArrowFormat();
 
     private static final String FORMAT = "arrow";
-    public static final String CONTENT_TYPE = "application/arrow";
-    private static final String VENDOR_CONTENT_TYPE = "application/vnd.elasticsearch+arrow";
+    // See https://www.iana.org/assignments/media-types/application/vnd.apache.arrow.stream
+    public static final String CONTENT_TYPE = "application/vnd.apache.arrow.stream";
+    private static final String VENDOR_CONTENT_TYPE = "application/vnd.elasticsearch+arrow+stream";
 
     @Override
     public String queryParameter() {

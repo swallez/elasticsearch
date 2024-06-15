@@ -18,7 +18,6 @@ import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BooleanBlock;
 import org.elasticsearch.compute.data.BytesRefBlock;
-import org.elasticsearch.compute.data.BytesRefVector;
 import org.elasticsearch.compute.data.DoubleBlock;
 import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.LongBlock;
@@ -111,10 +110,9 @@ public abstract class BlockConverter {
                 }
 
                 // TODO could we "just" get the memory of the array and dump it?
-                var vector = block.asVector();
                 int count = block.getPositionCount();
                 for (int i = 0; i < count; i++) {
-                    out.writeDoubleLE(vector.getDouble(i));
+                    out.writeDoubleLE(block.getDouble(i));
                 }
                 return vectorLength(block);
             });
@@ -147,10 +145,9 @@ public abstract class BlockConverter {
                 }
 
                 // TODO could we "just" get the memory of the array and dump it?
-                var vector = block.asVector();
                 int count = block.getPositionCount();
                 for (int i = 0; i < count; i++) {
-                    out.writeIntLE(vector.getInt(i));
+                    out.writeIntLE(block.getInt(i));
                 }
                 return vectorLength(block);
             });
@@ -185,10 +182,9 @@ public abstract class BlockConverter {
                 }
 
                 // TODO could we "just" get the memory of the array and dump it?
-                var vector = block.asVector();
                 int count = block.getPositionCount();
                 for (int i = 0; i < count; i++) {
-                    out.writeLongLE(vector.getLong(i));
+                    out.writeLongLE(block.getLong(i));
                 }
                 return vectorLength(block);
             });
@@ -220,9 +216,8 @@ public abstract class BlockConverter {
                 // Only set the bits that are true, writeBitSet will take
                 // care of adding zero bytes if needed.
                 if (block.areAllValuesNull() == false) {
-                    var vector = block.asVector();
                     for (int i = 0; i < count; i++) {
-                        if (vector.getBoolean(i)) {
+                        if (block.getBoolean(i)) {
                             bits.set(i);
                         }
                     }
@@ -265,14 +260,13 @@ public abstract class BlockConverter {
                 }
 
                 // TODO could we "just" get the memory of the array and dump it?
-                BytesRefVector vector = block.asVector();
                 BytesRef scratch = new BytesRef();
                 int offset = 0;
-                for (int i = 0; i < vector.getPositionCount(); i++) {
+                for (int i = 0; i < block.getPositionCount(); i++) {
                     out.writeIntLE(offset);
                     // FIXME: add a ByteRefsVector.getLength(position): there are some cases
                     // where getBytesRef will allocate, which isn't needed here.
-                    BytesRef v = vector.getBytesRef(i, scratch);
+                    BytesRef v = block.getBytesRef(i, scratch);
 
                     offset += v.length;
                 }
@@ -289,11 +283,10 @@ public abstract class BlockConverter {
                 }
 
                 // TODO could we "just" get the memory of the array and dump it?
-                var vector = block.asVector();
                 BytesRef scratch = new BytesRef();
                 long length = 0;
-                for (int i = 0; i < vector.getPositionCount(); i++) {
-                    BytesRef v = vector.getBytesRef(i, scratch);
+                for (int i = 0; i < block.getPositionCount(); i++) {
+                    BytesRef v = block.getBytesRef(i, scratch);
 
                     out.write(v.bytes, v.offset, v.length);
                     length += v.length;
@@ -312,12 +305,11 @@ public abstract class BlockConverter {
             }
 
             // TODO we can probably get the length from the vector without all this sum
-            BytesRefVector vector = block.asVector();
 
             int length = 0;
             BytesRef scratch = new BytesRef();
-            for (int i = 0; i < vector.getPositionCount(); i++) {
-                BytesRef v = vector.getBytesRef(i, scratch);
+            for (int i = 0; i < block.getPositionCount(); i++) {
+                BytesRef v = block.getBytesRef(i, scratch);
                 length += v.length;
             }
             return length;
@@ -444,7 +436,7 @@ public abstract class BlockConverter {
         for (int i = 0; i < count; i++) {
             out.writeByte((byte) 0x00);
         }
-        return valueCount;
+        return count;
     }
 
     private static long writeValidities(RecyclerBytesStreamOutput out, Block block) {

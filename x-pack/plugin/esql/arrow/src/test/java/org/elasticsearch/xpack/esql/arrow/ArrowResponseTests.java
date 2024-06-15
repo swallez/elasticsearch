@@ -7,413 +7,567 @@
 
 package org.elasticsearch.xpack.esql.arrow;
 
-import com.carrotsearch.randomizedtesting.annotations.Name;
-import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
-
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.DateMilliVector;
+import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.TimeStampMilliVector;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.ValueVector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
-import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.util.VectorSchemaRootAppender;
+import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.util.BytesRef;
+import org.elasticsearch.common.TriFunction;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.bytes.CompositeBytesReference;
-import org.elasticsearch.common.collect.Iterators;
-import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.BooleanBlock;
 import org.elasticsearch.compute.data.BytesRefBlock;
-import org.elasticsearch.compute.data.BytesRefVector;
 import org.elasticsearch.compute.data.DoubleBlock;
-import org.elasticsearch.compute.data.DoubleVector;
 import org.elasticsearch.compute.data.IntBlock;
-import org.elasticsearch.compute.data.IntVector;
+import org.elasticsearch.compute.data.IntVectorBlock;
 import org.elasticsearch.compute.data.LongBlock;
-import org.elasticsearch.compute.data.LongVector;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.rest.ChunkedRestResponseBody;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.transport.BytesRefRecycler;
-import org.junit.After;
+import org.elasticsearch.xpack.versionfield.Version;
+import org.junit.AfterClass;
+import org.junit.Test;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.function.IntFunction;
-import java.util.function.IntToDoubleFunction;
-import java.util.function.IntToLongFunction;
-import java.util.function.IntUnaryOperator;
-import java.util.function.Supplier;
+import java.util.NoSuchElementException;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 public class ArrowResponseTests extends ESTestCase {
-    @ParametersFactory
-    public static Iterable<Object[]> parameters() {
-        List<ArrowResponse.Column> justInt = List.of(new ArrowResponse.Column("integer", "a"));
-        List<ArrowResponse.Column> justLong = List.of(new ArrowResponse.Column("long", "a"));
-        List<ArrowResponse.Column> justDouble = List.of(new ArrowResponse.Column("double", "a"));
-        List<ArrowResponse.Column> justDate = List.of(new ArrowResponse.Column("date", "a"));
-        List<ArrowResponse.Column> justKeyword = List.of(new ArrowResponse.Column("keyword", "a"));
-
-        List<ArrowTestCase> cases = new ArrayList<>();
-
-        cases.add(new ArrowTestCase("integer no pages", justInt, () -> List.of()));
-        ArrowTestCase.cases(cases, "integer all zeros", justInt, () -> new Page(intVector(10, i -> 0).asBlock()));
-        ArrowTestCase.cases(cases, "integer increment", justInt, () -> new Page(intVector(10, i -> i).asBlock()));
-
-        cases.add(new ArrowTestCase("long no pages", justLong, () -> List.of()));
-        ArrowTestCase.cases(cases, "long all zeros", justLong, () -> new Page(longVector(10, i -> 0L).asBlock()));
-        ArrowTestCase.cases(cases, "long increment", justLong, () -> new Page(longVector(10, i -> i).asBlock()));
-
-        cases.add(new ArrowTestCase("double no pages", justDouble, () -> List.of()));
-        ArrowTestCase.cases(cases, "double all zeros", justDouble, () -> new Page(doubleVector(10, i -> 0L).asBlock()));
-        ArrowTestCase.cases(cases, "double increment", justDouble, () -> new Page(doubleVector(10, i -> i).asBlock()));
-
-        cases.add(new ArrowTestCase("date no pages", justDate, () -> List.of()));
-        ArrowTestCase.cases(cases, "date all zeros", justDate, () -> new Page(longVector(10, i -> 0L).asBlock()));
-        ArrowTestCase.cases(cases, "date increment", justDate, () -> new Page(longVector(10, i -> i).asBlock()));
-
-        cases.add(new ArrowTestCase("keyword no pages", justKeyword, () -> List.of()));
-        ArrowTestCase.cases(
-            cases,
-            "keyword empty",
-            justKeyword,
-            () -> new Page(bytesRefVector(10, i -> new BytesRef(BytesRef.EMPTY_BYTES, 0, 0)).asBlock())
-        );
-        ArrowTestCase.cases(cases, "keyword \"a\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("a")).asBlock()));
-        ArrowTestCase.cases(cases, "keyword \"foo\"", justKeyword, () -> new Page(bytesRefVector(10, i -> new BytesRef("foo")).asBlock()));
-        ArrowTestCase.cases(
-            cases,
-            "keyword \"foo\"|\"bar\"",
-            justKeyword,
-            () -> new Page(bytesRefVector(10, i -> i % 2 == 0 ? new BytesRef("foo") : new BytesRef("bar")).asBlock())
-        );
-
-        for (Map.Entry<String, IntFunction<Block>> first : RANDOM.entrySet()) {
-            ArrowTestCase.cases(
-                cases,
-                first.getKey(),
-                List.of(new ArrowResponse.Column(first.getKey(), "a")),
-                () -> new Page(first.getValue().apply(between(1, 10_000)))
-            );
-
-            for (Map.Entry<String, IntFunction<Block>> second : RANDOM.entrySet()) {
-                ArrowTestCase.cases(
-                    cases,
-                    first.getKey() + "|" + second.getKey(),
-                    List.of(new ArrowResponse.Column(first.getKey(), "a"), new ArrowResponse.Column(second.getKey(), "b")),
-                    () -> {
-                        int positions = between(1, 10_000);
-                        return new Page(first.getValue().apply(positions), second.getValue().apply(positions));
-                    }
-                );
-
-                for (Map.Entry<String, IntFunction<Block>> third : RANDOM.entrySet()) {
-                    ArrowTestCase.cases(
-                        cases,
-                        first.getKey() + "|" + second.getKey() + "|" + third.getKey(),
-                        List.of(
-                            new ArrowResponse.Column(first.getKey(), "a"),
-                            new ArrowResponse.Column(second.getKey(), "b"),
-                            new ArrowResponse.Column(third.getKey(), "c")
-                        ),
-                        () -> {
-                            int positions = between(1, 10_000);
-                            return new Page(
-                                first.getValue().apply(positions),
-                                second.getValue().apply(positions),
-                                third.getValue().apply(positions)
-                            );
-                        }
-                    );
-                }
-            }
-        }
-
-        return () -> cases.stream().map(c -> new Object[] { c }).iterator();
-    }
-
-    private static final Map<String, IntFunction<Block>> RANDOM = Map.ofEntries(
-        Map.entry("double", ArrowResponseTests::fullyRandomDoubleVector),
-        Map.entry("integer", ArrowResponseTests::fullyRandomIntVector),
-        Map.entry("long", ArrowResponseTests::fullyRandomLongVector),
-        Map.entry("date", ArrowResponseTests::fullyRandomLongVector),
-        Map.entry("keyword", ArrowResponseTests::fullyRandomKeywordVector)
-    );
-
-    private ArrowTestCase testCase;
-
-    public ArrowResponseTests(@Name("desc") ArrowTestCase testCase) {
-        this.testCase = testCase;
-    }
-
-    // TODO more schemata
-
-    private static final int BEFORE = 20;
-    private static final int AFTER = 80;
-
-    public void test() throws IOException {
-        BytesReference directBlocks = serializeBlocksDirectly();
-        BytesReference nativeArrow = serializeWithNativeArrow();
-
-        for (Page page: this.testCase.response.pages()) {
-            page.releaseBlocks();
-            page.toString();
-        }
-
-        int length = Math.max(directBlocks.length(), nativeArrow.length());
-        for (int i = 0; i < length; i++) {
-            if (directBlocks.length() < i || nativeArrow.length() < i) {
-                throw new AssertionError(
-                    "matched until ended:\n"
-                        + describeRange(directBlocks, nativeArrow, Math.max(0, i - BEFORE), Math.min(length, i + AFTER))
-                );
-            }
-            if (directBlocks.get(i) != nativeArrow.get(i)) {
-                throw new AssertionError(
-                    "first mismatch:\n" + describeRange(directBlocks, nativeArrow, Math.max(0, i - BEFORE), Math.min(length, i + AFTER))
-                );
-            }
-        }
-    }
-
-    @After
-    public void cleanup() {
-        for (Page page: this.testCase.response.pages()) {
-            page.releaseBlocks();
-        }
-        this.testCase = null;
-    }
-
-    private String describeRange(BytesReference directBlocks, BytesReference nativeArrow, int from, int to) {
-        StringBuilder b = new StringBuilder();
-        for (int i = from; i < to; i++) {
-            String d = positionToString(directBlocks, i);
-            String n = positionToString(nativeArrow, i);
-            b.append(String.format(Locale.ROOT, "%08d: ", i));
-            b.append(d);
-            b.append(' ');
-            b.append(n);
-            if (d.equals(n) == false) {
-                b.append(" <---");
-            }
-            b.append('\n');
-        }
-        return b.toString();
-    }
-
-    private String positionToString(BytesReference bytes, int i) {
-        return i < bytes.length() ? String.format(Locale.ROOT, "%02X", Byte.toUnsignedInt(bytes.get(i))) : "--";
-    }
-
-    private BytesReference serializeBlocksDirectly() throws IOException {
-        ChunkedRestResponseBody body = testCase.response().chunkedResponse();
-        List<BytesReference> ourEncoding = new ArrayList<>();
-        while (body.isDone() == false) {
-            ourEncoding.add(body.encodeChunk(1500, BytesRefRecycler.NON_RECYCLING_INSTANCE));
-        }
-
-        return CompositeBytesReference.of(ourEncoding.toArray(BytesReference[]::new));
-    }
-
-    private BytesReference serializeWithNativeArrow() throws IOException {
-        Schema schema = new Schema(testCase.response().columns().stream().map(ArrowResponse.Column::arrowField).toList());
-        try (
-            BufferAllocator rootAllocator = new RootAllocator();
-            VectorSchemaRoot schemaRoot = VectorSchemaRoot.create(schema, rootAllocator);
-            BytesStreamOutput out = new BytesStreamOutput();
-        ) {
-            try (ArrowStreamWriter writer = new ArrowStreamWriter(schemaRoot, null, out)) {
-                for (Page page : testCase.response.pages()) {
-                    schemaRoot.clear();
-                    for (int c = 0; c < testCase.response.columns().size(); c++) {
-                        ArrowResponse.Column column = testCase.response.columns().get(c);
-                        switch (column.esqlType()) {
-                            case "keyword" -> {
-                                BytesRef scratch = new BytesRef();
-                                BytesRefBlock b = page.getBlock(c);
-                                BytesRefVector v = b.asVector();
-                                if (v == null) {
-                                    throw new IllegalArgumentException();
-                                }
-                                VarCharVector arrow = (VarCharVector) schemaRoot.getVector(c);
-                                arrow.allocateNew(v.getPositionCount());
-                                for (int p = 0; p < v.getPositionCount(); p++) {
-                                    BytesRef bytes = v.getBytesRef(p, scratch);
-                                    arrow.setSafe(p, bytes.bytes, bytes.offset, bytes.length);
-                                }
-                                arrow.setValueCount(v.getPositionCount());
-                            }
-                            case "double" -> {
-                                DoubleBlock b = page.getBlock(c);
-                                DoubleVector v = b.asVector();
-                                if (v == null) {
-                                    throw new IllegalArgumentException();
-                                }
-                                Float8Vector arrow = (Float8Vector) schemaRoot.getVector(c);
-                                arrow.allocateNew(v.getPositionCount());
-                                for (int p = 0; p < v.getPositionCount(); p++) {
-                                    arrow.set(p, v.getDouble(p));
-                                }
-                                arrow.setValueCount(v.getPositionCount());
-                            }
-                            case "integer" -> {
-                                IntBlock b = page.getBlock(c);
-                                IntVector v = b.asVector();
-                                if (v == null) {
-                                    throw new IllegalArgumentException();
-                                }
-                                org.apache.arrow.vector.IntVector arrow = (org.apache.arrow.vector.IntVector) schemaRoot.getVector(c);
-                                arrow.allocateNew(v.getPositionCount());
-                                for (int p = 0; p < v.getPositionCount(); p++) {
-                                    arrow.set(p, v.getInt(p));
-                                }
-                                arrow.setValueCount(v.getPositionCount());
-                            }
-                            case "long" -> {
-                                LongBlock b = page.getBlock(c);
-                                LongVector v = b.asVector();
-                                if (v == null) {
-                                    throw new IllegalArgumentException();
-                                }
-                                BigIntVector arrow = (BigIntVector) schemaRoot.getVector(c);
-                                arrow.allocateNew(v.getPositionCount());
-                                for (int p = 0; p < v.getPositionCount(); p++) {
-                                    arrow.set(p, v.getLong(p));
-                                }
-                                arrow.setValueCount(v.getPositionCount());
-                            }
-                            case "date" -> {
-                                LongBlock b = page.getBlock(c);
-                                LongVector v = b.asVector();
-                                if (v == null) {
-                                    throw new IllegalArgumentException();
-                                }
-                                DateMilliVector arrow = (DateMilliVector) schemaRoot.getVector(c);
-                                arrow.allocateNew(v.getPositionCount());
-                                for (int p = 0; p < v.getPositionCount(); p++) {
-                                    arrow.set(p, v.getLong(p));
-                                }
-                                arrow.setValueCount(v.getPositionCount());
-                            }
-                            default -> throw new IllegalArgumentException("NOCOMMIT: " + column.esqlType());
-                        }
-                    }
-                    schemaRoot.setRowCount(page.getPositionCount());
-                    writer.writeBatch();
-                }
-            }
-            return out.bytes();
-        }
-    }
-
-    private static IntVector intVector(int positions, IntUnaryOperator v) {
-        IntVector.FixedBuilder builder = BLOCK_FACTORY.newIntVectorFixedBuilder(positions);
-        for (int i = 0; i < positions; i++) {
-            builder.appendInt(v.applyAsInt(i));
-        }
-        return builder.build();
-    }
-
-    private static Block fullyRandomIntVector(int positions) {
-        return intVector(positions, i -> randomInt()).asBlock();
-    }
-
-    private static LongVector longVector(int positions, IntToLongFunction v) {
-        LongVector.FixedBuilder builder = BLOCK_FACTORY.newLongVectorFixedBuilder(positions);
-        for (int i = 0; i < positions; i++) {
-            builder.appendLong(v.applyAsLong(i));
-        }
-        return builder.build();
-    }
-
-    private static Block fullyRandomLongVector(int positions) {
-        return longVector(positions, i -> randomLong()).asBlock();
-    }
-
-    private static DoubleVector doubleVector(int positions, IntToDoubleFunction v) {
-        DoubleVector.FixedBuilder builder = BLOCK_FACTORY.newDoubleVectorFixedBuilder(positions);
-        for (int i = 0; i < positions; i++) {
-            builder.appendDouble(v.applyAsDouble(i));
-        }
-        return builder.build();
-    }
-
-    private static Block fullyRandomDoubleVector(int positions) {
-        return doubleVector(positions, i -> randomDouble()).asBlock();
-    }
-
-    private static BytesRefVector bytesRefVector(int positions, IntFunction<BytesRef> v) {
-        BytesRefVector.Builder builder = BLOCK_FACTORY.newBytesRefVectorBuilder(positions);
-        for (int i = 0; i < positions; i++) {
-            builder.appendBytesRef(v.apply(i));
-        }
-        return builder.build();
-    }
-
-    private static Block fullyRandomKeywordVector(int positions) {
-        return bytesRefVector(positions, i -> new BytesRef(randomAlphaOfLengthBetween(0, 100))).asBlock();
-    }
 
     private static final BlockFactory BLOCK_FACTORY = BlockFactory.getInstance(
         new NoopCircuitBreaker("test-noop"),
         BigArrays.NON_RECYCLING_INSTANCE
     );
 
-    private static class ArrowTestCase {
-        private final String description;
-        private final List<ArrowResponse.Column> columns;
-        private final Supplier<List<Page>> pages;
-        private ArrowResponse response;
+    private static final RootAllocator ALLOCATOR = new RootAllocator();
 
-        static void cases(List<ArrowTestCase> cases, String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            cases.add(onePage(description, columns, page));
-            cases.add(twoPages(description, columns, page));
-            cases.add(randomPages(description, columns, page));
+    @AfterClass
+    public static void afterClass() throws Exception {
+        ALLOCATOR.close();
+    }
+
+    //---------------------------------------------------------------------------------------------
+    // Value creation, getters for ESQL and Arrow
+
+    static final ValueType INTEGER_VALUES = new ValueTypeImpl<IntBlock.Builder, IntBlock, IntVector> (
+        factory -> factory.newIntBlockBuilder(0),
+        block -> block.appendInt(randomInt()),
+        (block, i, scratch) -> block.getInt(i),
+        IntVector::get
+    );
+
+    static final ValueType LONG_VALUES = new ValueTypeImpl<LongBlock.Builder, LongBlock, BigIntVector>(
+        factory -> factory.newLongBlockBuilder(0),
+        block -> block.appendLong(randomLong()),
+        (block, i, scratch) -> block.getLong(i),
+        BigIntVector::get
+    );
+
+    static final ValueType ULONG_VALUES = new ValueTypeImpl<LongBlock.Builder, LongBlock, UInt8Vector>(
+        factory -> factory.newLongBlockBuilder(0),
+        block -> block.appendLong(randomLong()),
+        (block, i, scratch) -> block.getLong(i),
+        UInt8Vector::get
+    );
+
+    static final ValueType DATE_VALUES = new ValueTypeImpl<LongBlock.Builder, LongBlock, TimeStampMilliVector>(
+        factory -> factory.newLongBlockBuilder(0),
+        block -> block.appendLong(randomLong()),
+        (block, i, scratch) -> block.getLong(i),
+        TimeStampMilliVector::get
+    );
+
+    static final ValueType DOUBLE_VALUES = new ValueTypeImpl<DoubleBlock.Builder, DoubleBlock, Float8Vector>(
+        factory -> factory.newDoubleBlockBuilder(0),
+        block -> block.appendDouble(randomDouble()),
+        (block, i, scratch) -> block.getDouble(i),
+        Float8Vector::get
+    );
+
+    static final ValueType BOOLEAN_VALUES = new ValueTypeImpl<BooleanBlock.Builder, BooleanBlock, BitVector>(
+        factory -> factory.newBooleanBlockBuilder(0),
+        block -> block.appendBoolean(randomBoolean()),
+        (b, i, s) -> b.getBoolean(i),
+        (v, i) -> v.get(i) != 0 // Arrow's BitVector returns 0 or 1
+    );
+
+    static final ValueType TEXT_VALUES = new ValueTypeImpl<BytesRefBlock.Builder, BytesRefBlock, VarCharVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        block -> block.appendBytesRef(new BytesRef("🚀" + randomAlphaOfLengthBetween(1, 20))),
+        (b, i, s) -> b.getBytesRef(i, s).utf8ToString(),
+        (v, i) -> new String(v.get(i), StandardCharsets.UTF_8)
+    );
+
+    static final ValueType SOURCE_VALUES = new ValueTypeImpl<BytesRefBlock.Builder, BytesRefBlock, VarCharVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        // Use a constant value, conversion is tested separately
+        block -> block.appendBytesRef(new BytesRef("{\"foo\": 42}")),
+        (b, i, s) -> b.getBytesRef(i, s).utf8ToString(),
+        (v, i) -> new String(v.get(i), StandardCharsets.UTF_8)
+    );
+
+    static final ValueType IP_VALUES = new ValueTypeImpl<BytesRefBlock.Builder, BytesRefBlock, VarBinaryVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        block -> {
+            byte[] addr = InetAddressPoint.encode(randomIp(randomBoolean()));
+            assertEquals(16, addr.length); // Make sure all is ipv6-mapped
+            block.appendBytesRef(new BytesRef(addr));
+        },
+        (b, i, s) -> ValueConversions.shortenIpV4Addresses(b.getBytesRef(i, s), new BytesRef()),
+        (v, i) -> new BytesRef(v.get(i))
+    );
+
+    static final ValueType BINARY_VALUES = new ValueTypeImpl<BytesRefBlock.Builder, BytesRefBlock, VarBinaryVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        block -> block.appendBytesRef(new BytesRef(randomByteArrayOfLength(randomIntBetween(1, 100)))),
+        BytesRefBlock::getBytesRef,
+        (v, i) -> new BytesRef(v.get(i))
+    );
+
+    static final ValueType VERSION_VALUES = new ValueTypeImpl<BytesRefBlock.Builder, BytesRefBlock, VarCharVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        block -> block.appendBytesRef(new Version(between(0, 100) + "." + between(0, 100) + "." + between(0, 100)).toBytesRef()),
+        (b, i, s) -> new Version(b.getBytesRef(i, s)).toString(),
+        (v, i) -> new String(v.get(i), StandardCharsets.UTF_8)
+    );
+
+    static final ValueType NULL_VALUES = new ValueTypeImpl<Block.Builder, Block, FieldVector>(
+        factory -> factory.newBytesRefBlockBuilder(0),
+        Block.Builder::appendNull,
+        (b, i, s) -> b.isNull(i) ? null : "non-null in block",
+        (v, i) -> v.isNull(i) ? null : "non-null in vector"
+    );
+
+    static final Map<String, ValueType> VALUE_TYPES = Map.ofEntries(
+        Map.entry("integer", INTEGER_VALUES),
+        Map.entry("counter_integer", INTEGER_VALUES),
+        Map.entry("long", LONG_VALUES),
+        Map.entry("counter_long", LONG_VALUES),
+        Map.entry("unsigned_long", ULONG_VALUES),
+        Map.entry("double", DOUBLE_VALUES),
+        Map.entry("counter_double", DOUBLE_VALUES),
+
+        Map.entry("text", TEXT_VALUES),
+        Map.entry("keyword", TEXT_VALUES),
+
+        Map.entry("boolean", BOOLEAN_VALUES),
+        Map.entry("date", DATE_VALUES),
+        Map.entry("ip", IP_VALUES),
+        Map.entry("version", VERSION_VALUES),
+        Map.entry("_source", SOURCE_VALUES),
+
+        Map.entry("null", NULL_VALUES),
+        Map.entry("unsupported", NULL_VALUES),
+
+        // All geo types just pass-through WKB, use random binary data
+        Map.entry("geo_point", BINARY_VALUES),
+        Map.entry("geo_shape", BINARY_VALUES),
+        Map.entry("cartesian_point", BINARY_VALUES),
+        Map.entry("cartesian_shape", BINARY_VALUES)
+    );
+
+    //---------------------------------------------------------------------------------------------
+    // Tests
+
+    @Test
+    public void testTestHarness() {
+        TestColumn testColumn = TestColumn.create("foo", "integer");
+        TestBlock denseBlock = TestBlock.create(BLOCK_FACTORY, testColumn, Density.Dense, 3);
+        TestBlock sparseBlock = TestBlock.create(BLOCK_FACTORY, testColumn, Density.Sparse, 5);
+        TestBlock emptyBlock = TestBlock.create(BLOCK_FACTORY, testColumn, Density.Empty, 7);
+
+        // Test that density works as expected
+        assertTrue(denseBlock.block instanceof IntVectorBlock);
+        assertEquals("IntArrayBlock", sparseBlock.block.getClass().getSimpleName()); // non-public class
+        assertEquals("ConstantNullBlock", emptyBlock.block.getClass().getSimpleName());
+
+        // Test that values iterator scans all pages
+        List<TestPage> pages = Stream.of(denseBlock, sparseBlock, emptyBlock).map(b -> new TestPage(List.of(b))).toList();
+        TestCase tc = new TestCase(List.of(testColumn), pages);
+        EsqlValuesIterator valuesIterator = new EsqlValuesIterator(tc, 0);
+        int count = 0;
+        while (valuesIterator.hasNext()) {
+            valuesIterator.next();
+            count++;
         }
+        assertEquals(3+5+7, count);
 
-        static ArrowTestCase onePage(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new ArrowTestCase(description + " one page", columns, () -> List.of(page.get()));
-        }
+        // Test that we have value types for all types
+        List<String> converters = new ArrayList<>(ArrowResponse.ESQL_CONVERTERS.keySet());
+        Collections.sort(converters);
+        List<String> valueTypes = new ArrayList<>(VALUE_TYPES.keySet());
+        Collections.sort(valueTypes);
+        assertEquals("Missing test value types", converters, valueTypes);
+    }
 
-        static ArrowTestCase twoPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new ArrowTestCase(description + " two pages", columns, () -> List.of(page.get(), page.get()));
-        }
+    /**
+     * Test single-column for all types with a mix of dense/sparse/empty pages
+     */
+    @Test
+    public void testSingleColumn() throws IOException {
+        for (var type: VALUE_TYPES.keySet()) {
+            System.out.println("Type: " + type);
+            TestColumn testColumn = new TestColumn("foo", type, VALUE_TYPES.get(type));
+            List<TestPage> pages = new ArrayList<>();
 
-        static ArrowTestCase randomPages(String description, List<ArrowResponse.Column> columns, Supplier<Page> page) {
-            return new ArrowTestCase(description + " random pages", columns, () -> {
-                int pageCount = between(0, 10);
-                List<Page> pages = new ArrayList<>(pageCount);
-                for (int p = 0; p < pageCount; p++) {
-                    pages.add(page.get());
-                }
-                return pages;
-            });
-        }
-
-        private ArrowTestCase(String description, List<ArrowResponse.Column> columns, Supplier<List<Page>> pages) {
-            this.description = description;
-            this.columns = columns;
-            this.pages = pages;
-        }
-
-        ArrowResponse response() {
-            if (response == null) {
-                response = new ArrowResponse(columns, pages.get());
+            for (var density: Density.values()) {
+                TestBlock testBlock = TestBlock.create(BLOCK_FACTORY, testColumn, density, 10);
+                TestPage testPage = new TestPage(List.of(testBlock));
+                pages.add(testPage);
             }
-            return response;
+            TestCase testCase = new TestCase(List.of(testColumn), pages);
+
+            compareEsqlAndArrow(testCase);
+        }
+    }
+
+    @Test
+    public void testSingleBlock() throws IOException {
+        // Simple test to easily focus on a specific type & density
+        String type = "text";
+        Density density = Density.Dense;
+
+        TestColumn testColumn = new TestColumn("foo", type, VALUE_TYPES.get(type));
+        List<TestPage> pages = new ArrayList<>();
+
+        TestBlock testBlock = TestBlock.create(BLOCK_FACTORY, testColumn, density, 10);
+        TestPage testPage = new TestPage(List.of(testBlock));
+        pages.add(testPage);
+
+        TestCase testCase = new TestCase(List.of(testColumn), pages);
+
+        compareEsqlAndArrow(testCase);
+    }
+
+    /**
+     * Test a random set of types/columns/pages/densities
+     */
+    @Test
+    public void testRandomTypesAndSize() throws IOException {
+
+        // Shuffle types to randomize their succession in the Arrow stream
+        List<String> types = new ArrayList<>(VALUE_TYPES.keySet());
+        Collections.shuffle(types, random());
+
+        List<TestColumn> columns = types.stream()
+            .map(type -> TestColumn.create("col-" + type, type))
+            .toList();
+
+        List<TestPage> pages = IntStream
+            // 1 to 10 pages of random density and 1 to 1000 values
+            .range(0, randomIntBetween(1, 100))
+            .mapToObj(i -> TestPage.create(BLOCK_FACTORY, columns))
+            .toList();
+
+        TestCase testCase = new TestCase(columns, pages);
+        System.out.println(testCase);
+        for (TestPage page: pages) {
+            System.out.println(page);
+        }
+
+        compareEsqlAndArrow(testCase);
+    }
+
+    //---------------------------------------------------------------------------------------------
+    // Test harness
+
+    private void compareEsqlAndArrow(TestCase testCase) throws IOException {
+        try (VectorSchemaRoot arrowVectors = toArrowVectors(testCase)) {
+            compareEsqlAndArrow(testCase, arrowVectors);
+        }
+    }
+
+    private void compareEsqlAndArrow(TestCase testCase, VectorSchemaRoot root) {
+        for (int i = 0; i < testCase.columns.size(); i++) {
+
+            // Check esql type in the metadata
+            var metadata = root.getSchema().getFields().get(i).getMetadata();
+            assertEquals(testCase.columns.get(i).type, metadata.get("elastic:type"));
+
+            // Check values
+            var esqlValuesIterator = new EsqlValuesIterator(testCase, i);
+            var arrowValuesIterator = new ArrowValuesIterator(testCase, root, i);
+
+            while (esqlValuesIterator.hasNext() && arrowValuesIterator.hasNext()) {
+                assertEquals(esqlValuesIterator.next(), arrowValuesIterator.next());
+            }
+
+            // Make sure we entirely consumed both sides.
+            assertFalse(esqlValuesIterator.hasNext());
+            assertFalse(arrowValuesIterator.hasNext());
+        }
+    }
+
+    private VectorSchemaRoot toArrowVectors(TestCase testCase) throws IOException {
+        ArrowResponse ar = new ArrowResponse(
+            testCase.columns.stream().map(c ->
+                new ArrowResponse.Column(c.type, c.name)
+            ).toList(),
+            testCase.pages.stream().map(p ->
+                new Page(p.blocks.stream().map(b -> b.block).toArray(Block[]::new))
+            ).toList()
+        );
+
+        ChunkedRestResponseBody.FromMany response = ar.chunkedResponse();
+        assertEquals("application/vnd.apache.arrow.stream", response.getResponseContentTypeString());
+
+        BytesReference bytes = serializeBlocksDirectly(response);
+        try(
+            ArrowStreamReader reader = new ArrowStreamReader(bytes.streamInput(), ALLOCATOR);
+            VectorSchemaRoot readerRoot = reader.getVectorSchemaRoot();
+        ) {
+            VectorSchemaRoot root = VectorSchemaRoot.create(readerRoot.getSchema(), ALLOCATOR);
+            root.allocateNew();
+
+            while(reader.loadNextBatch()) {
+                VectorSchemaRootAppender.append(root, readerRoot);
+            }
+
+            return root;
+        }
+    }
+
+    /**
+     * An iterator over values of a column across all pages.
+     */
+    static class EsqlValuesIterator implements Iterator<Object> {
+        private final int fieldPos;
+        private final ValueType type;
+        private final BytesRef scratch = new BytesRef();
+        private final Iterator<TestPage> pages;
+
+        private TestPage page;
+        private int position;
+
+        EsqlValuesIterator(TestCase testCase, int column) {
+            this.fieldPos = column;
+            this.type = testCase.columns.get(column).valueType;
+            this.position = 0;
+            this.pages = testCase.pages.iterator();
+            this.page = pages.next();
+        }
+
+        @Override
+        public boolean hasNext() {
+            return page != null;
+        }
+
+        @Override
+        public Object next() {
+            if (page == null) {
+                throw new NoSuchElementException();
+            }
+            Block block = page.blocks.get(fieldPos).block;
+            Object result = block.isNull(position) ? null : type.valueAt(block, position, scratch);
+            position++;
+            if (position >= block.getPositionCount()) {
+                position = 0;
+                page = pages.hasNext() ? pages.next() : null;
+            }
+            return result;
+        }
+    }
+
+    static class ArrowValuesIterator implements Iterator<Object> {
+        private final ValueType type;
+        private ValueVector vector;
+        private int position;
+
+        ArrowValuesIterator(TestCase testCase, VectorSchemaRoot root, int column) {
+            this(root.getVector(column), testCase.columns.get(column).valueType);
+        }
+
+        ArrowValuesIterator(ValueVector vector, ValueType type) {
+            this.vector = vector;
+            this.type = type;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return vector != null;
+        }
+
+        @Override
+        public Object next() {
+            if (vector == null) {
+                throw new NoSuchElementException();
+            }
+            Object result = vector.isNull(position) ? null : type.valueAt(vector, position);
+            position++;
+            if (position >= vector.getValueCount()) {
+                vector = null;
+            }
+            return result;
+        }
+    }
+
+    private BytesReference serializeBlocksDirectly(ChunkedRestResponseBody body) throws IOException {
+        List<BytesReference> ourEncoding = new ArrayList<>();
+        int page = 0;
+        while (body.isDone() == false) {
+            ourEncoding.add(body.encodeChunk(1500, BytesRefRecycler.NON_RECYCLING_INSTANCE));
+            page++;
+        }
+        return CompositeBytesReference.of(ourEncoding.toArray(BytesReference[]::new));
+    }
+
+    record TestCase(List<TestColumn> columns, List<TestPage> pages) {
+        @Override
+        public String toString() {
+            return pages.size() + " pages of " +
+                columns.stream().map(TestColumn::type).collect(Collectors.joining("|"));
+        }
+    }
+
+    record TestColumn(String name, String type, ValueType valueType) {
+        static TestColumn create(String name, String type) {
+            return new TestColumn(name, type, VALUE_TYPES.get(type));
+        }
+    }
+
+    record TestPage(List<TestBlock> blocks) {
+
+        static TestPage create(BlockFactory factory, List<TestColumn> columns) {
+            int size = randomIntBetween(1, 1000);
+            return new TestPage(
+                columns.stream()
+                .map(column -> TestBlock.create(factory, column, size))
+                .toList()
+            );
         }
 
         @Override
         public String toString() {
-            return description;
+            return blocks.get(0).block.getPositionCount() + " items - " +
+                blocks.stream().map(b -> b.density.toString()).collect(Collectors.joining("|"));
+        }
+    }
+
+    record TestBlock(TestColumn column, Block block, Density density) {
+
+        static TestBlock create(BlockFactory factory, TestColumn column, int positions) {
+            return create(factory, column, randomFrom(Density.values()), positions);
+        }
+
+        static TestBlock create(BlockFactory factory, TestColumn column, Density density, int positions) {
+            ValueType valueType = column.valueType();
+            Block block;
+            if (density == Density.Empty) {
+                block = factory.newConstantNullBlock(positions);
+            } else {
+                Block.Builder builder = valueType.createBlockBuilder(factory);
+                int start = 0;
+                if (density == Density.Sparse && positions >= 2) {
+                    // Make sure it's really sparse even if randomness of values may decide otherwise
+                    valueType.addValue(builder, Density.Dense);
+                    valueType.addValue(builder, Density.Empty);
+                    start = 2;
+                }
+                for (int i = start; i < positions; i++) {
+                    valueType.addValue(builder, density);
+                }
+                // Will create an ArrayBlock if there are null values, VectorBlock otherwise
+                block = builder.build();
+            }
+            return new TestBlock(column, block, density);
+        }
+    }
+
+    public enum Density {
+        Empty,
+        Sparse,
+        Dense;
+
+        boolean nextIsNull() {
+            return switch (this) {
+                case Empty -> true;
+                case Sparse -> randomBoolean();
+                case Dense -> false;
+            };
+        }
+    }
+
+    interface ValueType {
+        Block.Builder createBlockBuilder(BlockFactory factory);
+        void addValue(Block.Builder builder, Density density);
+        Object valueAt(Block block, int position, BytesRef scratch);
+        Object valueAt(ValueVector arrowVec, int position);
+    }
+
+    public static class ValueTypeImpl<
+        BlockBT extends Block.Builder,
+        BlockT extends Block,
+        VectorT extends ValueVector
+    > implements ValueType {
+        private final Function<BlockFactory, BlockBT> builderCreator;
+        private final Consumer<BlockBT> valueAdder;
+        private final TriFunction<BlockT, Integer, BytesRef, Object> blockGetter;
+        private final BiFunction<VectorT, Integer, Object> vectorGetter;
+
+        public ValueTypeImpl(
+            Function<BlockFactory, BlockBT> builderCreator,
+            Consumer<BlockBT> valueAdder,
+            TriFunction<BlockT, Integer, BytesRef, Object> blockGetter,
+            BiFunction<VectorT, Integer, Object> vectorGetter
+        ) {
+            this.builderCreator = builderCreator;
+            this.valueAdder = valueAdder;
+            this.blockGetter = blockGetter;
+            this.vectorGetter = vectorGetter;
+        }
+
+        @Override
+        public Block.Builder createBlockBuilder(BlockFactory factory) {
+            return builderCreator.apply(factory);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public void addValue(Block.Builder builder, Density density) {
+            if (density.nextIsNull()) {
+                builder.appendNull();
+            } else {
+                valueAdder.accept((BlockBT) builder);
+            }
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Object valueAt(Block block, int position, BytesRef scratch) {
+            return blockGetter.apply((BlockT) block, position, scratch);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Object valueAt(ValueVector arrowVec, int position) {
+            return vectorGetter.apply((VectorT)arrowVec, position);
         }
     }
 }
