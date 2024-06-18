@@ -15,7 +15,6 @@ import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.common.xcontent.ChunkedToXContent;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.IOUtils;
-import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.RestApiVersion;
 import org.elasticsearch.core.Streams;
@@ -30,8 +29,6 @@ import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
-import java.util.Objects;
-import java.util.stream.Stream;
 
 /**
  * The body of a rest response that uses chunked HTTP encoding. Implementations are used to avoid materializing full responses on heap and
@@ -223,85 +220,5 @@ public interface ChunkedRestResponseBody {
                 return contentType;
             }
         };
-    }
-
-    /**
-     * Create a chunked response from several chunked parts. The result is {@link Releasable}
-     * @param first
-     * @param rest
-     * @return
-     */
-    static ChunkedRestResponseBody.FromMany fromMany(ChunkedRestResponseBody first, Iterator<? extends ChunkedRestResponseBody> rest) {
-        return new FromMany(first, rest);
-    }
-
-    /**
-     * A chunked response body built from several chunked parts. It is {@link Releasable} and will release any {@link Releasable}
-     * part.
-     */
-    // NOCOMMIT is it ok to reintroduce releasable here while it was somehow removed in #104752 ?
-    class FromMany implements ChunkedRestResponseBody, Releasable {
-
-        private final ChunkedRestResponseBody first;
-        private final Iterator<? extends ChunkedRestResponseBody> rest;
-
-        private final String contentType;
-        private ChunkedRestResponseBody current;
-
-        public FromMany(ChunkedRestResponseBody first, Iterator<? extends ChunkedRestResponseBody> rest) {
-            this.first = first;
-            this.rest = rest;
-
-            contentType = first.getResponseContentTypeString();
-            current = first;
-        }
-
-        @Override
-        public boolean isDone() {
-            return current == null;
-        }
-
-        @Override
-        public ReleasableBytesReference encodeChunk(int sizeHint, Recycler<BytesRef> recycler) throws IOException {
-            try {
-                return current.encodeChunk(sizeHint, recycler);
-            } finally {
-                if (current.isDone()) {
-                    if (current instanceof Releasable releasable) {
-                        Releasables.closeExpectNoException(releasable);
-                    }
-                    if (false == rest.hasNext()) {
-                        current = null;
-                    } else {
-                        current = rest.next();
-                        if (false == contentType.equals(current.getResponseContentTypeString())) {
-                            throw new IllegalArgumentException(
-                                "content types much match but were ["
-                                    + contentType
-                                    + "] and ["
-                                    + current.getResponseContentTypeString()
-                                    + "]"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        @Override
-        public String getResponseContentTypeString() {
-            return contentType;
-        }
-
-        @Override
-        public void close() {
-            // Close all remaining portions
-            Iterator<Releasable> releasables = Stream.concat(Stream.of(current), Stream.of(rest))
-                .map(c -> c instanceof Releasable r ? r : null)
-                .filter(Objects::nonNull)
-                .iterator();
-
-            Releasables.closeExpectNoException(Releasables.wrap(releasables));
-        }
     }
 }

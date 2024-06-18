@@ -46,6 +46,8 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -66,7 +68,9 @@ public class ArrowResponseTests extends ESTestCase {
         BigArrays.NON_RECYCLING_INSTANCE
     );
 
-    private static final RootAllocator ALLOCATOR = new RootAllocator();
+    private static final RootAllocator ALLOCATOR = AccessController.doPrivileged(
+        (PrivilegedAction<RootAllocator>) () ->  new RootAllocator()
+    );
 
     @AfterClass
     public static void afterClass() throws Exception {
@@ -326,7 +330,7 @@ public class ArrowResponseTests extends ESTestCase {
     }
 
     private VectorSchemaRoot toArrowVectors(TestCase testCase) throws IOException {
-        ArrowResponse ar = new ArrowResponse(
+        ArrowResponse response = new ArrowResponse(
             testCase.columns.stream().map(c ->
                 new ArrowResponse.Column(c.type, c.name)
             ).toList(),
@@ -335,7 +339,6 @@ public class ArrowResponseTests extends ESTestCase {
             ).toList()
         );
 
-        ChunkedRestResponseBody.FromMany response = ar.chunkedResponse();
         assertEquals("application/vnd.apache.arrow.stream", response.getResponseContentTypeString());
 
         BytesReference bytes = serializeBlocksDirectly(response);

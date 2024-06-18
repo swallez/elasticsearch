@@ -26,80 +26,90 @@ import org.elasticsearch.common.io.stream.RecyclerBytesStreamOutput;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.Page;
+import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.rest.ChunkedRestResponseBody;
-import org.elasticsearch.xpack.esql.arrow.shim.Shim;
+import org.elasticsearch.xpack.esql.arrow.shim.AllocationManagerShim;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-public class ArrowResponse {
+public class ArrowResponse implements ChunkedRestResponseBody, Releasable {
 
     public static class Column {
-        private final String esqlType;
         private final BlockConverter converter;
         private final String name;
 
         public Column(String esqlType, String name) {
-            this.esqlType = esqlType;
             this.converter = ESQL_CONVERTERS.get(esqlType);
             if (converter == null) {
                 throw new IllegalArgumentException("ES|QL type [" + esqlType + "] is not supported by the Arrow format");
             }
             this.name = name;
         }
-
-        String esqlType() {
-            return esqlType;
-        }
-
-        Field arrowField() {
-            return new Field(name, converter.arrowFieldType(), List.of());
-        }
     }
 
     private final List<Column> columns;
-    private final List<Page> pages;
+    private Iterator<ResponseSegment> segments;
+    private ResponseSegment currentSegment;
 
     public ArrowResponse(List<Column> columns, List<Page> pages) {
         this.columns = columns;
-        this.pages = pages;
-    }
 
-    List<Column> columns() {
-        return columns;
-    }
-
-    List<Page> pages() {
-        return pages;
-    }
-
-    public ChunkedRestResponseBody.FromMany chunkedResponse() {
-        // TODO dictionaries
-
-        SchemaResponse schemaResponse = new SchemaResponse(this);
-        List<ChunkedRestResponseBody> rest = new ArrayList<>(pages.size());
+        currentSegment = new SchemaResponse(this);
+        List<ResponseSegment> rest = new ArrayList<>(pages.size());
         for (int p = 0; p < pages.size(); p++) {
             rest.add(new PageResponse(this, pages.get(p)));
         }
         rest.add(new EndResponse(this));
-
-        return ChunkedRestResponseBody.fromMany(schemaResponse, rest.iterator());
+        segments = rest.iterator();
     }
 
-    protected abstract static class AbstractArrowChunkedResponse implements ChunkedRestResponseBody {
+    @Override
+    public boolean isDone() {
+        return currentSegment == null;
+    }
+
+    @Override
+    public ReleasableBytesReference encodeChunk(int sizeHint, Recycler<BytesRef> recycler) throws IOException {
+        try {
+            return currentSegment.encodeChunk(sizeHint, recycler);
+        } finally {
+            if (currentSegment.isDone()) {
+                currentSegment = segments.hasNext() ? segments.next() : null;
+            }
+        }
+    }
+
+    @Override
+    public String getResponseContentTypeString() {
+        return ArrowFormat.CONTENT_TYPE;
+    }
+
+    @Override
+    public void close() {
+        currentSegment = null;
+        segments = null;
+    }
+
+    /**
+     * An Arrow response is composed of different segments, each being a set of chunks:
+     * the schema header, the data buffers, and the trailer.
+     */
+    protected abstract static class ResponseSegment implements ChunkedRestResponseBody {
         static {
-            // Init the arrow shim
-            Shim.init();
+            // Init the Arrow memory manager shim
+            AllocationManagerShim.init();
         }
 
         protected final ArrowResponse response;
 
-        AbstractArrowChunkedResponse(ArrowResponse response) {
+        ResponseSegment(ArrowResponse response) {
             this.response = response;
         }
 
@@ -155,7 +165,7 @@ public class ArrowResponse {
 
         @Override
         public final String getResponseContentTypeString() {
-            return ArrowFormat.CONTENT_TYPE;
+            throw new UnsupportedOperationException();
         }
     }
 
@@ -164,7 +174,7 @@ public class ArrowResponse {
      *
      * @see <a href="https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format">IPC Streaming Format</a>
      */
-    private static class SchemaResponse extends AbstractArrowChunkedResponse {
+    private static class SchemaResponse extends ResponseSegment {
         private boolean done = false;
 
         SchemaResponse(ArrowResponse response) {
@@ -184,14 +194,16 @@ public class ArrowResponse {
         }
 
         private Schema arrowSchema() {
-            return new Schema(response.columns.stream().map(ArrowResponse.Column::arrowField).toList());
+            return new Schema(response.columns.stream().map(
+                c -> new Field(c.name, c.converter.arrowFieldType(), List.of())
+            ).toList());
         }
     }
 
     /**
-     * Write an ES|QL page as an Arrow RecordBatch
+     * Page response segment: write an ES|QL page as an Arrow RecordBatch
      */
-    private static class PageResponse extends AbstractArrowChunkedResponse {
+    private static class PageResponse extends ResponseSegment {
         private final Page page;
         private boolean done = false;
 
@@ -279,7 +291,10 @@ public class ArrowResponse {
         }
     }
 
-    private static class EndResponse extends AbstractArrowChunkedResponse {
+    /**
+     * Trailer segment: write the Arrow end of stream marker
+     */
+    private static class EndResponse extends ResponseSegment {
         private boolean done = false;
 
         private EndResponse(ArrowResponse response) {

@@ -139,14 +139,15 @@ public final class EsqlResponseListener extends RestRefCountedChunkedToXContentL
                     releasable
                 );
             } else if (mediaType == ArrowFormat.INSTANCE) {
-                ChunkedRestResponseBody.FromMany arrowResponse = new ArrowResponse(
+                ArrowResponse arrowResponse = new ArrowResponse(
+                    // Map here to avoid cyclic dependencies between the arrow subproject and its parent
                     esqlResponse.columns().stream().map(c -> new ArrowResponse.Column(c.type(), c.name())).toList(),
                     esqlResponse.pages()
-                ).chunkedResponse();
+                );
                 restResponse = RestResponse.chunked(
                     RestStatus.OK,
                     arrowResponse,
-                    Releasables.wrap(arrowResponse, esqlResponse)
+                    Releasables.wrap(arrowResponse, releasable)
                 );
             } else {
                 restResponse = RestResponse.chunked(
