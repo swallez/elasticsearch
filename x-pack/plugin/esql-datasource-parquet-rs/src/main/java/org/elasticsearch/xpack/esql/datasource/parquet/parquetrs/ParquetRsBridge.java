@@ -11,8 +11,10 @@ package org.elasticsearch.xpack.esql.datasource.parquet.parquetrs;
  * JNI bridge to the Rust parquet-rs based Parquet reader.
  * <p>
  * Uses the Arrow C Data Interface for zero-copy batch transfer from Rust to Java.
- * Filter expressions are built incrementally as a FilterExpr tree in Rust
- * via the {@code create*} methods, then passed to {@link #openReader} as an opaque handle.
+ * Filter expressions are encoded as FlatBuffers (schema in
+ * {@code native/schema/filter_expr.fbs}) and passed to {@link #openReader} as a
+ * {@code byte[]}; the native side decodes them on demand. See
+ * {@link ParquetRsFilterPushdownSupport} for the Java-side encoder.
  */
 final class ParquetRsBridge {
 
@@ -23,8 +25,9 @@ final class ParquetRsBridge {
     /**
      * Opens a parquet-rs reader with optional filter.
      *
-     * @param filterHandle opaque handle to a FilterExpr built via create* methods, or 0 for no filter.
-     *                     The native side clones the expr; the handle remains valid for reuse across files.
+     * @param filter FlatBuffers-encoded {@code FilterExpr} payload (see
+     *               {@code native/schema/filter_expr.fbs}), or {@code null} / empty for no filter.
+     *               The native side decodes the bytes; ownership of the array stays with the JVM.
      * @param configJson JSON-serialized storage configuration from the ESQL WITH clause, or null.
      */
     static native long openReader(
@@ -32,7 +35,7 @@ final class ParquetRsBridge {
         String[] projectedColumns,
         int batchSize,
         long limit,
-        long filterHandle,
+        byte[] filter,
         String configJson
     );
 
@@ -41,7 +44,7 @@ final class ParquetRsBridge {
         String[] projectedColumns,
         int batchSize,
         long limit,
-        long filterHandle,
+        byte[] filter,
         String configJson
     );
 
@@ -66,72 +69,4 @@ final class ParquetRsBridge {
 
     /** Returns column statistics as [name0, nullCount0, min0, max0, name1, ...]. Empty string = absent. */
     static native String[] getColumnStatistics(String filePath, String configJson);
-
-    // ---- Filter expression building ----
-    //
-    // Native handle ownership contract for every {@code create*} method below:
-    // * On success the method returns a fresh native handle (a {@code jlong}). The
-    // Java caller owns it and must eventually pass it to {@link #freeExpr} or to
-    // another {@code create*} method as an input.
-    // * On failure the method throws a Java exception (typically RuntimeException)
-    // and returns 0.
-    // * Every input handle passed in is consumed by the call regardless of whether
-    // it succeeds or throws. Java callers MUST NOT call {@link #freeExpr} on an
-    // input handle after passing it to a {@code create*} method, even on failure.
-    // * Each handle is single-use: pass it to exactly one downstream call (a
-    // {@code create*} or {@link #freeExpr}).
-    //
-    // The recommended Java-side pattern is to wrap fresh handles in {@link ExprHandle}
-    // and call {@link ExprHandle#release} immediately before passing them to a
-    // {@code create*} method, so try-with-resources cleanup is a no-op on the success
-    // path and a no-op (rather than a double-free) if the {@code create*} call throws.
-
-    static native long createColumn(String name);
-
-    static native long createLiteralInt(int value);
-
-    static native long createLiteralLong(long value);
-
-    static native long createLiteralTimestampMillis(long value);
-
-    static native long createLiteralDouble(double value);
-
-    static native long createLiteralBool(boolean value);
-
-    static native long createLiteralString(String value);
-
-    static native long createEquals(long left, long right);
-
-    static native long createNotEquals(long left, long right);
-
-    static native long createGreaterThan(long left, long right);
-
-    static native long createGreaterThanOrEqual(long left, long right);
-
-    static native long createLessThan(long left, long right);
-
-    static native long createLessThanOrEqual(long left, long right);
-
-    static native long createAnd(long left, long right);
-
-    static native long createOr(long left, long right);
-
-    static native long createNot(long child);
-
-    static native long createIsNull(long child);
-
-    static native long createIsNotNull(long child);
-
-    static native long createInList(long exprHandle, long[] listHandles);
-
-    static native long createStartsWith(long colHandle, String prefix, String upperBound);
-
-    static native long createLike(long colHandle, String pattern);
-
-    static native long createNotLike(long colHandle, String pattern);
-
-    static native void freeExpr(long handle);
-
-    /** Returns a human-readable string representation of a FilterExpr. */
-    static native String describeExpr(long handle);
 }

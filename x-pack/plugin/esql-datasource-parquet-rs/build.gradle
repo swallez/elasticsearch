@@ -44,6 +44,92 @@ dependencies {
 }
 
 // ---------------------------------------------------------------------------
+// FlatBuffers code generation
+// ---------------------------------------------------------------------------
+//
+// We do NOT use a host-installed `flatc`; the schemas must be compiled with
+// the exact compiler versions used by Arrow-Java and Arrow-Rust.
+//
+// See also native/schema/build-flatc-images.sh
+//
+// Both tasks mount the project root into the container at `/workspace` and
+// invoke flatc with paths relative to that mount point. Tasks are skipped on
+// hosts without Docker, mirroring how `cargoBuild` skips when `cargo` is
+// missing.
+
+def fbsSchemaDir = "${project.projectDir}/native/schema"
+def fbsSchemaFiles = ["filter_expr.fbs"]
+def generatedJavaDir = "${project.layout.buildDirectory.get().asFile}/generated/sources/flatbuffers/main/java"
+def generatedRustDir = "${project.projectDir}/native/src/generated"
+//def flatcImage         = "docker.elastic.co/elasticsearch-dev/flatbuffers"
+def flatcImage = "flatbuffers"
+def flatcJavaVersion = "v23.5.26"
+def flatcRustVersion = "v25.12.19"
+def projectMount = "${project.projectDir}:/workspace"
+
+def dockerPath = org.gradle.internal.os.OperatingSystem.current().findInPath("docker")
+
+tasks.register("generateFlatBuffersJava", Exec) {
+  description = "Generate Java sources from .fbs schemas using flatc-java in the esql-flatc Docker image"
+  inputs.dir(fbsSchemaDir)
+  outputs.dir(generatedJavaDir)
+  doFirst {
+    delete generatedJavaDir
+    mkdir generatedJavaDir
+  }
+  def schemaArgs = fbsSchemaFiles.collect { "native/schema/${it}" }
+  commandLine(["docker", "run", "--rm",
+                "-v", projectMount,
+                "-w", "/workspace",
+                "${flatcImage}:${flatcJavaVersion}",
+                "flatc",
+                "--java",
+                "-o", "build/generated/sources/flatbuffers/main/java"] + schemaArgs)
+  onlyIf { dockerPath != null }
+}
+
+tasks.register("generateFlatBuffersRust", Exec) {
+  description = "Generate Rust sources from .fbs schemas using flatc-rust in the esql-flatc Docker image"
+  inputs.dir(fbsSchemaDir)
+  // Outputs are the *_generated.rs files only, not the directory: native/src/generated/mod.rs
+  // is hand-written (it re-exports the deeply-nested namespace as `fbs`) and must survive
+  // regeneration.
+  outputs.files(fileTree(generatedRustDir) { include "*_generated.rs" })
+  doFirst {
+    delete fileTree(generatedRustDir) { include "*_generated.rs" }
+    mkdir generatedRustDir
+  }
+  def schemaArgs = fbsSchemaFiles.collect { "native/schema/${it}" }
+  commandLine(["docker", "run", "--rm",
+                "-v", projectMount,
+                "-w", "/workspace",
+                "${flatcImage}:${flatcRustVersion}",
+                "flatc",
+                "--rust",
+                "-o", "native/src/generated"] + schemaArgs)
+  onlyIf { dockerPath != null }
+}
+
+sourceSets {
+  main {
+    java {
+      srcDir generatedJavaDir
+    }
+  }
+}
+
+tasks.named("compileJava").configure {
+  dependsOn "generateFlatBuffersJava"
+}
+
+// generateNotice walks the main java source set without going through compileJava,
+// so it doesn't pick up the dependency above. Wire it explicitly per the Gradle
+// validation error's recommendation.
+tasks.named("generateNotice").configure {
+  dependsOn "generateFlatBuffersJava"
+}
+
+// ---------------------------------------------------------------------------
 // Native Rust library build
 // ---------------------------------------------------------------------------
 def nativeDir = "${project.projectDir}/native"
@@ -69,6 +155,7 @@ def resourceTarget = "${project.projectDir}/src/main/resources/platform/${platfo
 
 tasks.register("cargoBuild", Exec) {
   description = "Build the native parquet-rs library with cargo (release mode)"
+  dependsOn "generateFlatBuffersRust"
   workingDir nativeDir
 
   def cargoPath = org.gradle.internal.os.OperatingSystem.current().findInPath("cargo")
@@ -99,8 +186,14 @@ tasks.register("copyNativeLib", Copy) {
   onlyIf { new File("${cargoOutputDir}/${libFileName}").exists() }
 }
 
+// Force everything else to run after the native library is in place, so
+// downstream consumers (test, processResources, ...) see the .dylib/.so.
+// generateFlatBuffersRust is excluded because cargoBuild depends on it —
+// participating in the mustRunAfter would create a cargoBuild → generate →
+// copyNativeLib → cargoBuild cycle.
+def afterCopyNativeLibExclusions = ["copyNativeLib", "cargoBuild", "generateFlatBuffersRust"] as Set
 tasks.configureEach { task ->
-  if (task.name != "copyNativeLib" && task.name != "cargoBuild") {
+  if (afterCopyNativeLibExclusions.contains(task.name) == false) {
     task.mustRunAfter("copyNativeLib")
   }
 }

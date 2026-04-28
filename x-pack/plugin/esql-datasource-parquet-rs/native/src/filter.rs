@@ -1,3 +1,10 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
 use super::jni_utils::*;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array,
@@ -18,8 +25,10 @@ use parquet::file::metadata::RowGroupMetaData;
 use parquet::schema::types::SchemaDescriptor;
 use std::sync::Arc;
 
-/// Filter expression tree built from Java via JNI, evaluated against
-/// both row group statistics (for pruning) and decoded Arrow batches (for row filtering).
+/// Filter expression tree decoded from a FlatBuffers payload supplied by the
+/// Java side (see `native/schema/filter_expr.fbs` and `filter_fb::decode`),
+/// evaluated against both row group statistics (for pruning) and decoded
+/// Arrow batches (for row filtering).
 #[derive(Clone, Debug)]
 pub enum FilterExpr {
     Column(String),

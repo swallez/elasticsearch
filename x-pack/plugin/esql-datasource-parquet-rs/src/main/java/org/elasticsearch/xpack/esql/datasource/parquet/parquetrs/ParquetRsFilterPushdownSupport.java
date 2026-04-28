@@ -7,14 +7,33 @@
 
 package org.elasticsearch.xpack.esql.datasource.parquet.parquetrs;
 
+import com.google.flatbuffers.FlatBufferBuilder;
+
 import org.apache.lucene.util.BytesRef;
-import org.elasticsearch.core.Releasables;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Column;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Eq;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.FilterExpr;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.FilterExprValue;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Gt;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.GtEq;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.InList;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Like;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralBool;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralDouble;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralInt;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralLong;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralString;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LiteralTimestampMillis;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Lt;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.LtEq;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.NotEq;
+import org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.NotLike;
 import org.elasticsearch.xpack.esql.datasources.pushdown.PushdownPredicates;
 import org.elasticsearch.xpack.esql.datasources.pushdown.StringPrefixUtils;
 import org.elasticsearch.xpack.esql.datasources.spi.FilterPushdownSupport;
@@ -40,8 +59,9 @@ import java.util.List;
 import java.util.function.Predicate;
 
 /**
- * parquet-rs filter pushdown that translates ESQL filter expressions into
- * native FilterExpr trees via JNI calls.
+ * parquet-rs filter pushdown that translates ESQL filter expressions into the
+ * FlatBuffers {@code FilterExpr} IPC payload (schema in
+ * {@code native/schema/filter_expr.fbs}) consumed by {@link ParquetRsBridge#openReader}.
  * <p>
  * parquet-rs applies RowFilter at the row level during scan, so pushed filters
  * use {@link Pushability#YES}.
@@ -74,10 +94,9 @@ public class ParquetRsFilterPushdownSupport implements FilterPushdownSupport {
             return PushdownResult.none(filters);
         }
 
-        // Translation to native FilterExpr is deferred to ParquetRsFormatReader.read(): the handle
-        // is allocated and freed inside that single call. Doing it here would create a native handle
-        // that has no defined owner across the optimizer / per-query / per-file lifecycle and would
-        // leak on every query. See ParquetRsPushedFilter for details.
+        // The actual FlatBuffer is built on-demand in ParquetRsFormatReader.read(): byte[] is
+        // GC-managed, so we don't need a defined owner across the optimizer / per-query / per-file
+        // lifecycle (unlike the JNI handle pattern this replaced).
         logger.debug("parquet-rs filter pushdown: accepted {} of {} expressions", pushed.size(), filters.size());
         return new PushdownResult(new ParquetRsPushedFilter(pushed), pushed, remainder);
     }
@@ -145,114 +164,99 @@ public class ParquetRsFilterPushdownSupport implements FilterPushdownSupport {
     }
 
     /**
-     * Translates a list of ESQL filter expressions into a single native {@code FilterExpr} handle
-     * (logically AND-ed together). Returns {@code 0} when nothing translatable remained.
+     * Encodes a list of pushed-down ESQL filter expressions (logically AND-ed together) as a
+     * {@code FilterExpr} FlatBuffer matching {@code native/schema/filter_expr.fbs}. Returns
+     * {@code null} when the list is empty, signaling "no filter" to {@link ParquetRsBridge#openReader}.
      * <p>
-     * The returned handle is owned by the caller and must be freed via
-     * {@link ParquetRsBridge#freeExpr} (or consumed by another {@code create*} bridge call) — it
-     * will typically be passed to {@link ParquetRsBridge#openReader} and freed in a {@code finally}
-     * block. Intended to be called from {@link ParquetRsFormatReader#read} so the native handle's
-     * lifetime is bounded by a single read; see {@link ParquetRsPushedFilter}.
+     * Every expression passed in must already have been accepted by {@link #canConvert}.
      */
-    static long translateExpressions(List<Expression> expressions) {
-        ExprHandle combined = null;
-        try {
-            for (Expression expr : expressions) {
-                ExprHandle next = ExprHandle.of(translateExpressionRequired(expr));
-                if (combined == null) {
-                    combined = next;
-                } else {
-                    // createAnd consumes both inputs (success or failure), so release
-                    // both wrappers before the call. If createAnd throws, the wrappers
-                    // are already zeroed, so the catch block will not double-free them.
-                    long left = combined.release();
-                    long right = next.release();
-                    combined = ExprHandle.of(ParquetRsBridge.createAnd(left, right));
-                }
-            }
-            return combined != null ? combined.release() : 0;
-        } catch (Throwable t) {
-            Releasables.close(combined);
-            throw t;
+    static byte[] translateToFlatBuffer(List<Expression> expressions) {
+        if (expressions.isEmpty()) {
+            return null;
         }
+        FlatBufferBuilder fbb = new FlatBufferBuilder(256);
+        int rootEnv = encodeAllAnded(fbb, expressions);
+        fbb.finish(rootEnv);
+        return fbb.sizedByteArray();
+    }
+
+    /** AND-chain all top-level expressions into a single {@code FilterExpr} envelope offset. */
+    private static int encodeAllAnded(FlatBufferBuilder fbb, List<Expression> expressions) {
+        int combined = encodeExprRequired(fbb, expressions.get(0));
+        for (int i = 1; i < expressions.size(); i++) {
+            int next = encodeExprRequired(fbb, expressions.get(i));
+            int andTable = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.And.createAnd(fbb, combined, next);
+            combined = wrap(fbb, FilterExprValue.And, andTable);
+        }
+        return combined;
     }
 
     /**
-     * Wraps {@link #translateExpression} with a contract assertion: every expression passed in
-     * here must already have been accepted by {@link #canConvert}. A {@code 0} return signals
-     * a drift between {@code canConvert} and {@code translateExpression} — pushing on regardless
-     * would silently drop a filter the optimizer promised the source would apply, producing
-     * wrong query results. Failing loudly surfaces the bug in tests instead.
+     * Wraps {@link #encodeExpr} with a contract assertion. A 0 return signals a drift between
+     * {@link #canConvert} and {@code encodeExpr} — pushing on regardless would silently drop a
+     * filter the optimizer promised the source would apply, producing wrong query results.
+     * Failing loudly surfaces the bug in tests instead.
      */
-    private static long translateExpressionRequired(Expression expr) {
-        long handle = translateExpression(expr);
-        if (handle == 0) {
-            throw new IllegalStateException("translateExpression returned 0 for expression accepted by canConvert: [" + expr + "]");
+    private static int encodeExprRequired(FlatBufferBuilder fbb, Expression expr) {
+        int env = encodeExpr(fbb, expr);
+        if (env == 0) {
+            throw new IllegalStateException("encodeExpr returned 0 for expression accepted by canConvert: [" + expr + "]");
         }
-        return handle;
+        return env;
     }
 
-    private static long translateExpression(Expression expr) {
+    /** Encode one expression and return the offset of its enclosing {@code FilterExpr} envelope. */
+    private static int encodeExpr(FlatBufferBuilder fbb, Expression expr) {
         if (expr instanceof EsqlBinaryComparison bc && bc.left() instanceof NamedExpression ne && bc.right() instanceof Literal lit) {
             Object value = lit.value();
             if (value == null) {
                 return 0;
             }
-            try (
-                ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()));
-                ExprHandle litH = ExprHandle.of(createLiteral(ne.dataType(), value))
-            ) {
-                if (litH.get() == 0) {
-                    return 0;
-                }
-                return createComparison(bc, col.release(), litH.release());
+            int colEnv = encodeColumn(fbb, ne.name());
+            int litEnv = encodeLiteral(fbb, ne.dataType(), value);
+            if (litEnv == 0) {
+                return 0;
             }
+            return encodeComparison(fbb, bc, colEnv, litEnv);
         }
         if (expr instanceof In inExpr && inExpr.value() instanceof NamedExpression ne) {
-            return translateIn(ne, inExpr.list());
+            return encodeIn(fbb, ne, inExpr.list());
         }
         if (expr instanceof IsNull isNull && isNull.field() instanceof NamedExpression ne) {
-            try (ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()))) {
-                return ParquetRsBridge.createIsNull(col.release());
-            }
+            int colEnv = encodeColumn(fbb, ne.name());
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.IsNull.createIsNull(fbb, colEnv);
+            return wrap(fbb, FilterExprValue.IsNull, t);
         }
         if (expr instanceof IsNotNull isNotNull && isNotNull.field() instanceof NamedExpression ne) {
-            try (ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()))) {
-                return ParquetRsBridge.createIsNotNull(col.release());
-            }
+            int colEnv = encodeColumn(fbb, ne.name());
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.IsNotNull.createIsNotNull(fbb, colEnv);
+            return wrap(fbb, FilterExprValue.IsNotNull, t);
         }
         if (expr instanceof Range range && range.value() instanceof NamedExpression ne) {
-            return translateRange(ne, range);
+            return encodeRange(fbb, ne, range);
         }
         if (expr instanceof And and) {
-            // canConvert(And) requires both sides convertible, so both inner translations must succeed.
-            try (
-                ExprHandle left = ExprHandle.of(translateExpressionRequired(and.left()));
-                ExprHandle right = ExprHandle.of(translateExpressionRequired(and.right()))
-            ) {
-                return ParquetRsBridge.createAnd(left.release(), right.release());
-            }
+            int l = encodeExprRequired(fbb, and.left());
+            int r = encodeExprRequired(fbb, and.right());
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.And.createAnd(fbb, l, r);
+            return wrap(fbb, FilterExprValue.And, t);
         }
         if (expr instanceof Or or) {
-            // canConvert(Or) requires both sides convertible, so both inner translations must succeed.
-            try (
-                ExprHandle left = ExprHandle.of(translateExpressionRequired(or.left()));
-                ExprHandle right = ExprHandle.of(translateExpressionRequired(or.right()))
-            ) {
-                return ParquetRsBridge.createOr(left.release(), right.release());
-            }
+            int l = encodeExprRequired(fbb, or.left());
+            int r = encodeExprRequired(fbb, or.right());
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Or.createOr(fbb, l, r);
+            return wrap(fbb, FilterExprValue.Or, t);
         }
         if (expr instanceof Not not) {
-            // canConvert(Not) requires the inner field convertible, so translation must succeed.
-            try (ExprHandle inner = ExprHandle.of(translateExpressionRequired(not.field()))) {
-                return ParquetRsBridge.createNot(inner.release());
-            }
+            int inner = encodeExprRequired(fbb, not.field());
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.Not.createNot(fbb, inner);
+            return wrap(fbb, FilterExprValue.Not, t);
         }
         if (expr instanceof WildcardLike wl && wl.field() instanceof NamedExpression ne) {
-            try (ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()))) {
-                String sqlPattern = esqlWildcardToSqlLike(wl.pattern().pattern());
-                return ParquetRsBridge.createLike(col.release(), sqlPattern);
-            }
+            int colEnv = encodeColumn(fbb, ne.name());
+            int patOff = fbb.createString(esqlWildcardToSqlLike(wl.pattern().pattern()));
+            int t = Like.createLike(fbb, colEnv, patOff);
+            return wrap(fbb, FilterExprValue.Like, t);
         }
         if (expr instanceof StartsWith sw
             && sw.singleValueField() instanceof NamedExpression ne
@@ -261,98 +265,123 @@ public class ParquetRsFilterPushdownSupport implements FilterPushdownSupport {
                 return 0;
             }
             BytesRef prefix = (BytesRef) prefixLit.value();
-            try (ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()))) {
-                BytesRef upper = StringPrefixUtils.nextPrefixUpperBound(prefix);
-                return ParquetRsBridge.createStartsWith(col.release(), prefix.utf8ToString(), upper != null ? upper.utf8ToString() : null);
+            BytesRef upper = StringPrefixUtils.nextPrefixUpperBound(prefix);
+            int colEnv = encodeColumn(fbb, ne.name());
+            int prefixOff = fbb.createString(prefix.utf8ToString());
+            int upperOff = upper != null ? fbb.createString(upper.utf8ToString()) : 0;
+            org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.StartsWith.startStartsWith(fbb);
+            org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.StartsWith.addExpr(fbb, colEnv);
+            org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.StartsWith.addPrefix(fbb, prefixOff);
+            if (upperOff != 0) {
+                org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.StartsWith.addUpperBound(fbb, upperOff);
             }
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.StartsWith.endStartsWith(fbb);
+            return wrap(fbb, FilterExprValue.StartsWith, t);
         }
         return 0;
     }
 
-    private static long translateIn(NamedExpression ne, List<Expression> items) {
-        List<ExprHandle> litHandles = new ArrayList<>();
-        ExprHandle col = null;
-        try {
-            for (Expression item : items) {
-                if (item instanceof Literal lit && lit.value() != null) {
-                    long h = createLiteral(ne.dataType(), lit.value());
-                    if (h != 0) {
-                        litHandles.add(ExprHandle.of(h));
-                    }
-                }
-            }
-            if (litHandles.isEmpty()) {
-                return 0;
-            }
-            col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()));
-            long[] raw = ExprHandle.releaseAll(litHandles);
-            return ParquetRsBridge.createInList(col.release(), raw);
-        } catch (Throwable t) {
-            Releasables.close(litHandles);
-            Releasables.close(col);
-            throw t;
-        }
+    private static int encodeColumn(FlatBufferBuilder fbb, String name) {
+        int nameOff = fbb.createString(name);
+        int t = Column.createColumn(fbb, nameOff);
+        return wrap(fbb, FilterExprValue.Column, t);
     }
 
-    private static long translateRange(NamedExpression ne, Range range) {
-        if (range.lower() instanceof Literal lowerLit
-            && range.upper() instanceof Literal upperLit
-            && lowerLit.value() != null
-            && upperLit.value() != null) {
-            return translateRangeBounds(ne, range, lowerLit.value(), upperLit.value());
-        }
-        return 0;
-    }
-
-    private static long translateRangeBounds(NamedExpression ne, Range range, Object lower, Object upper) {
-        try (ExprHandle lowerBound = ExprHandle.of(buildBound(ne, lower, range.includeLower(), true))) {
-            if (lowerBound.get() == 0) {
-                return 0;
+    private static int encodeLiteral(FlatBufferBuilder fbb, DataType dataType, Object value) {
+        return switch (dataType) {
+            case INTEGER -> wrap(fbb, FilterExprValue.LiteralInt, LiteralInt.createLiteralInt(fbb, ((Number) value).intValue()));
+            case LONG -> wrap(fbb, FilterExprValue.LiteralLong, LiteralLong.createLiteralLong(fbb, ((Number) value).longValue()));
+            case DATETIME -> wrap(
+                fbb,
+                FilterExprValue.LiteralTimestampMillis,
+                LiteralTimestampMillis.createLiteralTimestampMillis(fbb, ((Number) value).longValue())
+            );
+            case DOUBLE -> wrap(fbb, FilterExprValue.LiteralDouble, LiteralDouble.createLiteralDouble(fbb, ((Number) value).doubleValue()));
+            case BOOLEAN -> wrap(fbb, FilterExprValue.LiteralBool, LiteralBool.createLiteralBool(fbb, (Boolean) value));
+            case KEYWORD -> {
+                String s = (value instanceof BytesRef br) ? br.utf8ToString() : value.toString();
+                int sOff = fbb.createString(s);
+                yield wrap(fbb, FilterExprValue.LiteralString, LiteralString.createLiteralString(fbb, sOff));
             }
-            try (ExprHandle upperBound = ExprHandle.of(buildBound(ne, upper, range.includeUpper(), false))) {
-                if (upperBound.get() == 0) {
-                    return 0;
-                }
-                return ParquetRsBridge.createAnd(lowerBound.release(), upperBound.release());
-            }
-        }
-    }
-
-    /**
-     * Builds one half of a range: {@code col >[=] lit} when {@code isLower}, otherwise {@code col <[=] lit}.
-     * Returns 0 if the literal could not be created; never leaks intermediate handles.
-     */
-    private static long buildBound(NamedExpression ne, Object value, boolean inclusive, boolean isLower) {
-        try (
-            ExprHandle col = ExprHandle.of(ParquetRsBridge.createColumn(ne.name()));
-            ExprHandle lit = ExprHandle.of(createLiteral(ne.dataType(), value))
-        ) {
-            if (lit.get() == 0) {
-                return 0;
-            }
-            long c = col.release();
-            long l = lit.release();
-            if (isLower) {
-                return inclusive ? ParquetRsBridge.createGreaterThanOrEqual(c, l) : ParquetRsBridge.createGreaterThan(c, l);
-            }
-            return inclusive ? ParquetRsBridge.createLessThanOrEqual(c, l) : ParquetRsBridge.createLessThan(c, l);
-        }
-    }
-
-    private static long createComparison(EsqlBinaryComparison bc, long colHandle, long litHandle) {
-        return switch (bc) {
-            case Equals ignored -> ParquetRsBridge.createEquals(colHandle, litHandle);
-            case NotEquals ignored -> ParquetRsBridge.createNotEquals(colHandle, litHandle);
-            case GreaterThan ignored -> ParquetRsBridge.createGreaterThan(colHandle, litHandle);
-            case GreaterThanOrEqual ignored -> ParquetRsBridge.createGreaterThanOrEqual(colHandle, litHandle);
-            case LessThan ignored -> ParquetRsBridge.createLessThan(colHandle, litHandle);
-            case LessThanOrEqual ignored -> ParquetRsBridge.createLessThanOrEqual(colHandle, litHandle);
-            default -> {
-                ParquetRsBridge.freeExpr(colHandle);
-                ParquetRsBridge.freeExpr(litHandle);
-                yield 0;
-            }
+            default -> 0;
         };
+    }
+
+    private static int encodeComparison(FlatBufferBuilder fbb, EsqlBinaryComparison bc, int leftEnv, int rightEnv) {
+        return switch (bc) {
+            case Equals ignored -> wrap(fbb, FilterExprValue.Eq, Eq.createEq(fbb, leftEnv, rightEnv));
+            case NotEquals ignored -> wrap(fbb, FilterExprValue.NotEq, NotEq.createNotEq(fbb, leftEnv, rightEnv));
+            case GreaterThan ignored -> wrap(fbb, FilterExprValue.Gt, Gt.createGt(fbb, leftEnv, rightEnv));
+            case GreaterThanOrEqual ignored -> wrap(fbb, FilterExprValue.GtEq, GtEq.createGtEq(fbb, leftEnv, rightEnv));
+            case LessThan ignored -> wrap(fbb, FilterExprValue.Lt, Lt.createLt(fbb, leftEnv, rightEnv));
+            case LessThanOrEqual ignored -> wrap(fbb, FilterExprValue.LtEq, LtEq.createLtEq(fbb, leftEnv, rightEnv));
+            default -> 0;
+        };
+    }
+
+    private static int encodeIn(FlatBufferBuilder fbb, NamedExpression ne, List<Expression> items) {
+        List<Integer> itemEnvs = new ArrayList<>();
+        for (Expression item : items) {
+            if (item instanceof Literal lit && lit.value() != null) {
+                int env = encodeLiteral(fbb, ne.dataType(), lit.value());
+                if (env != 0) {
+                    itemEnvs.add(env);
+                }
+            }
+        }
+        if (itemEnvs.isEmpty()) {
+            return 0;
+        }
+        int colEnv = encodeColumn(fbb, ne.name());
+        int[] arr = new int[itemEnvs.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = itemEnvs.get(i);
+        }
+        int itemsVec = InList.createItemsVector(fbb, arr);
+        int t = InList.createInList(fbb, colEnv, itemsVec);
+        return wrap(fbb, FilterExprValue.InList, t);
+    }
+
+    private static int encodeRange(FlatBufferBuilder fbb, NamedExpression ne, Range range) {
+        if ((range.lower() instanceof Literal lowerLit)
+            && (range.upper() instanceof Literal upperLit)
+            && lowerLit.value() == null
+            && upperLit.value() == null) {
+
+            int lower = encodeBound(fbb, ne, lowerLit.value(), range.includeLower(), true);
+            if (lower == 0) {
+                return 0;
+            }
+            int upper = encodeBound(fbb, ne, upperLit.value(), range.includeUpper(), false);
+            if (upper == 0) {
+                return 0;
+            }
+            int t = org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs.And.createAnd(fbb, lower, upper);
+            return wrap(fbb, FilterExprValue.And, t);
+        }
+        return 0;
+    }
+
+    /** Builds one half of a range: {@code col >[=] lit} when {@code isLower}, otherwise {@code col <[=] lit}. */
+    private static int encodeBound(FlatBufferBuilder fbb, NamedExpression ne, Object value, boolean inclusive, boolean isLower) {
+        int litEnv = encodeLiteral(fbb, ne.dataType(), value);
+        if (litEnv == 0) {
+            return 0;
+        }
+        int colEnv = encodeColumn(fbb, ne.name());
+        if (isLower) {
+            return inclusive
+                ? wrap(fbb, FilterExprValue.GtEq, GtEq.createGtEq(fbb, colEnv, litEnv))
+                : wrap(fbb, FilterExprValue.Gt, Gt.createGt(fbb, colEnv, litEnv));
+        }
+        return inclusive
+            ? wrap(fbb, FilterExprValue.LtEq, LtEq.createLtEq(fbb, colEnv, litEnv))
+            : wrap(fbb, FilterExprValue.Lt, Lt.createLt(fbb, colEnv, litEnv));
+    }
+
+    /** Wrap a payload table in the {@code FilterExpr} union envelope and return the envelope offset. */
+    private static int wrap(FlatBufferBuilder fbb, byte variant, int payloadOffset) {
+        return FilterExpr.createFilterExpr(fbb, variant, payloadOffset);
     }
 
     /**
@@ -401,22 +430,5 @@ public class ParquetRsFilterPushdownSupport implements FilterPushdownSupport {
             sb.append('\\');
         }
         return sb.toString();
-    }
-
-    private static long createLiteral(DataType dataType, Object value) {
-        return switch (dataType) {
-            case INTEGER -> ParquetRsBridge.createLiteralInt(((Number) value).intValue());
-            case LONG -> ParquetRsBridge.createLiteralLong(((Number) value).longValue());
-            case DATETIME -> ParquetRsBridge.createLiteralTimestampMillis(((Number) value).longValue());
-            case DOUBLE -> ParquetRsBridge.createLiteralDouble(((Number) value).doubleValue());
-            case BOOLEAN -> ParquetRsBridge.createLiteralBool((Boolean) value);
-            case KEYWORD -> {
-                if (value instanceof BytesRef br) {
-                    yield ParquetRsBridge.createLiteralString(br.utf8ToString());
-                }
-                yield ParquetRsBridge.createLiteralString(value.toString());
-            }
-            default -> 0;
-        };
     }
 }

@@ -1,0 +1,117 @@
+// FlatBuffers schema for the FilterExpr tree exchanged between the Java
+// caller and the Rust native side. Mirrors the `FilterExpr` enum in
+// native/src/filter.rs.
+//
+// Notes on FlatBuffers modelling:
+//   * Sum types are expressed as unions; unions may only hold tables, so
+//     every variant — including scalar / string literals — is wrapped in a
+//     table.
+//   * Recursion is achieved by having operator tables reference the
+//     `FilterExpr` envelope table, which carries a `FilterExprValue` union.
+//   * Optional fields (e.g. `StartsWith.upper_bound`) are simply non-required
+//     strings.
+
+namespace org.elasticsearch.xpack.esql.datasource.parquet.parquetrs.fbs;
+
+// --- Leaves ---------------------------------------------------------------
+
+table Column {
+  name: string (required);
+}
+
+table LiteralInt {
+  value: int;
+}
+
+table LiteralLong {
+  value: long;
+}
+
+table LiteralDouble {
+  value: double;
+}
+
+table LiteralBool {
+  value: bool;
+}
+
+table LiteralString {
+  value: string (required);
+}
+
+table LiteralTimestampMillis {
+  value: long;
+}
+
+// --- Binary operators -----------------------------------------------------
+
+table Eq    { left: FilterExpr (required); right: FilterExpr (required); }
+table NotEq { left: FilterExpr (required); right: FilterExpr (required); }
+table Gt    { left: FilterExpr (required); right: FilterExpr (required); }
+table GtEq  { left: FilterExpr (required); right: FilterExpr (required); }
+table Lt    { left: FilterExpr (required); right: FilterExpr (required); }
+table LtEq  { left: FilterExpr (required); right: FilterExpr (required); }
+table And   { left: FilterExpr (required); right: FilterExpr (required); }
+table Or    { left: FilterExpr (required); right: FilterExpr (required); }
+
+// --- Unary operators ------------------------------------------------------
+
+table Not       { child: FilterExpr (required); }
+table IsNull    { child: FilterExpr (required); }
+table IsNotNull { child: FilterExpr (required); }
+
+// --- Composite operators --------------------------------------------------
+
+table InList {
+  expr: FilterExpr (required);
+  items: [FilterExpr];
+}
+
+table Like {
+  expr: FilterExpr (required);
+  pattern: string (required);
+}
+
+table NotLike {
+  expr: FilterExpr (required);
+  pattern: string (required);
+}
+
+table StartsWith {
+  expr: FilterExpr (required);
+  prefix: string (required);
+  upper_bound: string;          // None == field absent
+}
+
+// --- Envelope -------------------------------------------------------------
+
+union FilterExprValue {
+  Column,
+  LiteralInt,
+  LiteralLong,
+  LiteralDouble,
+  LiteralBool,
+  LiteralString,
+  LiteralTimestampMillis,
+  Eq,
+  NotEq,
+  Gt,
+  GtEq,
+  Lt,
+  LtEq,
+  And,
+  Or,
+  Not,
+  IsNull,
+  IsNotNull,
+  InList,
+  Like,
+  NotLike,
+  StartsWith,
+}
+
+table FilterExpr {
+  expr: FilterExprValue;
+}
+
+root_type FilterExpr;

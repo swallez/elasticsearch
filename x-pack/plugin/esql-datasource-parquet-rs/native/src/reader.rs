@@ -1,16 +1,25 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
 use std::ptr;
 use std::sync::Arc;
 
 use super::ASYNC_RUNTIME;
 use super::filter::{self, FilterExpr};
+use super::filter_fb;
 use super::jni_utils::extract_storage_config;
 use arrow::array::{Array, StructArray};
 use arrow::ffi;
 use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
+use jni::Env;
 use jni::EnvUnowned;
 use jni::errors::{Error as JniError, Result as JniResult, ThrowRuntimeExAndDefault};
-use jni::objects::{JClass, JObjectArray, JString};
+use jni::objects::{JByteArray, JClass, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use super::store::{StorageConfig, resolve_store, needs_file_size_hint};
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -50,6 +59,26 @@ fn err(e: impl std::fmt::Display) -> JniError {
     JniError::ParseFailed(format!("{e}"))
 }
 
+/// Decode a FlatBuffers-encoded `FilterExpr` passed in from the Java side.
+///
+/// Returns `None` for a `null` Java reference or an empty payload, both of
+/// which mean "no filter pushdown" — the same convention the Java caller
+/// already uses for the `byte[] filter` argument.
+fn decode_filter_arg(
+    env: &mut Env,
+    fb: &JByteArray<'_>,
+) -> JniResult<Option<Arc<FilterExpr>>> {
+    if fb.is_null() {
+        return Ok(None);
+    }
+    let bytes = env.convert_byte_array(fb)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let expr = filter_fb::decode(&bytes).map_err(err)?;
+    Ok(Some(Arc::new(expr)))
+}
+
 // ---------------------------------------------------------------------------
 // JNI entry points
 // ---------------------------------------------------------------------------
@@ -64,7 +93,7 @@ pub extern "system" fn Java_org_elasticsearch_xpack_esql_datasource_parquet_parq
     projected_columns: JObjectArray,
     batch_size: jint,
     limit: jlong,
-    filter_handle: jlong,
+    filter_fb: JByteArray,
     config_json: JString,
 ) -> jlong {
     env.with_env(|env| -> JniResult<jlong> {
@@ -84,11 +113,7 @@ pub extern "system" fn Java_org_elasticsearch_xpack_esql_datasource_parquet_parq
             Some(cols)
         };
 
-        let filter: Option<Arc<FilterExpr>> = if filter_handle != 0 {
-            Some(Arc::new(unsafe { &*(filter_handle as *const FilterExpr) }.clone()))
-        } else {
-            None
-        };
+        let filter = decode_filter_arg(env, &filter_fb)?;
 
         let plan = build_plan_string(&file_path_str, &projected_cols, batch_size, limit, &filter);
 
@@ -114,7 +139,7 @@ pub extern "system" fn Java_org_elasticsearch_xpack_esql_datasource_parquet_parq
     projected_columns: JObjectArray,
     batch_size: jint,
     limit: jlong,
-    filter_handle: jlong,
+    filter_fb: JByteArray,
     config_json: JString,
 ) -> jlong {
     env.with_env(|env| -> JniResult<jlong> {
@@ -140,11 +165,7 @@ pub extern "system" fn Java_org_elasticsearch_xpack_esql_datasource_parquet_parq
             Some(cols)
         };
 
-        let filter: Option<Arc<FilterExpr>> = if filter_handle != 0 {
-            Some(Arc::new(unsafe { &*(filter_handle as *const FilterExpr) }.clone()))
-        } else {
-            None
-        };
+        let filter = decode_filter_arg(env, &filter_fb)?;
 
         let plan = build_plan_string(&paths.join(", "), &projected_cols, batch_size, limit, &filter);
 

@@ -67,8 +67,9 @@ public class ParquetRsFormatReader implements FormatReader {
     private final BlockFactory blockFactory;
     /**
      * Filter expressions accepted for pushdown by {@link ParquetRsFilterPushdownSupport}. Translated
-     * to a native {@code FilterExpr} on every {@link #read} call and freed in the same call, so the
-     * reader itself never owns a JNI handle (and therefore cannot leak one).
+     * to a FlatBuffers payload on every {@link #read} call (see
+     * {@link ParquetRsFilterPushdownSupport#translateToFlatBuffer}); the resulting {@code byte[]}
+     * is GC-managed, so the reader holds no native filter resources between calls.
      */
     private final List<Expression> pushedExpressions;
     private final String configJson;
@@ -243,28 +244,16 @@ public class ParquetRsFormatReader implements FormatReader {
         String[] columns = projectedColumns != null && projectedColumns.isEmpty() == false ? projectedColumns.toArray(new String[0]) : null;
         long limit = rowLimit == FormatReader.NO_LIMIT ? -1 : rowLimit;
 
-        // Native FilterExpr ownership is bounded by this method: build it here, hand it to
-        // openReader which clones it internally, then free our copy in the finally. This keeps
-        // the reader stateless w.r.t. native memory so it cannot leak across queries / files.
-        long filterHandle = 0;
-        long readerHandle = 0;
+        // The filter is encoded as a FlatBuffer (GC-managed byte[]) and decoded native-side in
+        // openReader. The native reader handle is the only resource we manage by hand: it
+        // transfers to the iterator on success and is closed in the catch on failure.
+        byte[] filterFb = pushedExpressions.isEmpty() ? null : ParquetRsFilterPushdownSupport.translateToFlatBuffer(pushedExpressions);
+        long readerHandle = ParquetRsBridge.openReader(path, columns, batchSize, limit, filterFb, configJson);
         try {
-            if (pushedExpressions.isEmpty() == false) {
-                filterHandle = ParquetRsFilterPushdownSupport.translateExpressions(pushedExpressions);
-            }
-            readerHandle = ParquetRsBridge.openReader(path, columns, batchSize, limit, filterHandle, configJson);
-            ParquetRsBatchIterator iterator = new ParquetRsBatchIterator(readerHandle, blockFactory);
-            // Ownership of readerHandle has transferred to the iterator's close(); zero our copy
-            // so the finally below doesn't double-free it.
-            readerHandle = 0;
-            return iterator;
-        } finally {
-            if (filterHandle != 0) {
-                ParquetRsBridge.freeExpr(filterHandle);
-            }
-            if (readerHandle != 0) {
-                ParquetRsBridge.closeReader(readerHandle);
-            }
+            return new ParquetRsBatchIterator(readerHandle, blockFactory);
+        } catch (Throwable t) {
+            ParquetRsBridge.closeReader(readerHandle);
+            throw t;
         }
     }
 
