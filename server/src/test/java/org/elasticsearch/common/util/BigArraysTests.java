@@ -569,6 +569,82 @@ public class BigArraysTests extends ESTestCase {
         assertThat(realBreaker.getUsed(), equalTo(0L));
     }
 
+    public void testNewByteArrayClearZeroesSmallAllocation() {
+        // Small allocation path: size < BYTE_PAGE_SIZE / 2, recycler-null branch in BigArrays.newByteArray.
+        // clearOnResize=true must return a zero-filled buffer regardless of whether the underlying
+        // allocation skipped the JLS zero-fill.
+        BigArrays noRecycler = new BigArrays(null, new NoneCircuitBreakerService(), CircuitBreaker.REQUEST);
+        int size = randomIntBetween(1, PageCacheRecycler.BYTE_PAGE_SIZE / 2 - 1);
+        ByteArray array = noRecycler.newByteArray(size, true);
+        try {
+            for (int i = 0; i < size; i++) {
+                assertEquals("byte at " + i, (byte) 0, array.get(i));
+            }
+        } finally {
+            array.close();
+        }
+    }
+
+    public void testNewByteArrayClearZeroesBigByteArray() {
+        // Large allocation path: BigByteArray with multiple pages, clearOnResize=true must zero every page.
+        int size = PageCacheRecycler.BYTE_PAGE_SIZE * randomIntBetween(2, 4) + randomIntBetween(0, 100);
+        ByteArray array = bigArrays.newByteArray(size, true);
+        try {
+            for (int i = 0; i < size; i++) {
+                assertEquals("byte at " + i, (byte) 0, array.get(i));
+            }
+        } finally {
+            array.close();
+        }
+    }
+
+    public void testNewByteArrayNoClearIsWritable() {
+        // clearOnResize=false: contents are undefined, but the array must be fully writable/readable.
+        // Covers both the small path (UnsafeAllocator direct) and the BigByteArray path.
+        int size = randomFrom(
+            randomIntBetween(1, PageCacheRecycler.BYTE_PAGE_SIZE / 2 - 1),
+            PageCacheRecycler.BYTE_PAGE_SIZE * randomIntBetween(2, 4)
+        );
+        ByteArray array = bigArrays.newByteArray(size, false);
+        try {
+            byte[] expected = new byte[size];
+            for (int i = 0; i < size; i++) {
+                expected[i] = randomByte();
+                array.set(i, expected[i]);
+            }
+            for (int i = 0; i < size; i++) {
+                assertEquals(expected[i], array.get(i));
+            }
+        } finally {
+            array.close();
+        }
+    }
+
+    public void testBigByteArrayCrossPageGetReturnsCorrectBytes() {
+        // BigByteArray#get fills the cross-page BytesRef from an UnsafeAllocator-allocated scratch buffer.
+        // Even though the scratch is uninitialized, the System.arraycopy calls must fully cover it.
+        int size = PageCacheRecycler.BYTE_PAGE_SIZE * 3;
+        byte[] expected = new byte[size];
+        random().nextBytes(expected);
+        ByteArray array = bigArrays.newByteArray(size, randomBoolean());
+        try {
+            for (int i = 0; i < size; i++) {
+                array.set(i, expected[i]);
+            }
+            // Read spans across two page boundaries.
+            BytesRef ref = new BytesRef();
+            int offset = PageCacheRecycler.BYTE_PAGE_SIZE - 100;
+            int len = PageCacheRecycler.BYTE_PAGE_SIZE + 200;
+            array.get(offset, len, ref);
+            assertEquals(len, ref.length);
+            for (int i = 0; i < len; i++) {
+                assertEquals("byte at " + i, expected[offset + i], ref.bytes[ref.offset + i]);
+            }
+        } finally {
+            array.close();
+        }
+    }
+
     private List<BigArraysHelper> bigArrayCreators(final long maxSize, final boolean withBreaking) {
         final BigArrays byteBigArrays = newBigArraysInstance(maxSize, withBreaking);
         BigArraysHelper byteHelper = new BigArraysHelper(

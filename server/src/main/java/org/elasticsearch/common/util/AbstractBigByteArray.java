@@ -60,8 +60,10 @@ abstract class AbstractBigByteArray extends AbstractBigArray {
         if (recycler != null) {
             final Recycler.V<byte[]> v = recycler.bytePage(clearOnResize);
             return registerNewPage(v, page, PageCacheRecycler.BYTE_PAGE_SIZE);
-        } else {
+        } else if (clearOnResize) {
             return new byte[PageCacheRecycler.BYTE_PAGE_SIZE];
+        } else {
+            return UnsafeAllocator.newUninitializedByteArray(PageCacheRecycler.BYTE_PAGE_SIZE);
         }
     }
 

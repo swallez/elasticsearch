@@ -103,7 +103,8 @@ public class PageCacheRecycler {
         bytePage = build(type, maxBytePageCount, allocatedProcessors, new AbstractRecyclerC<>() {
             @Override
             public byte[] newInstance() {
-                return new byte[BYTE_PAGE_SIZE];
+                // Pages are zero-filled on demand by bytePage(true); skip the JLS zero-fill here.
+                return UnsafeAllocator.newUninitializedByteArray(BYTE_PAGE_SIZE);
             }
 
             @Override
@@ -140,7 +141,8 @@ public class PageCacheRecycler {
 
     public Recycler.V<byte[]> bytePage(boolean clear) {
         final Recycler.V<byte[]> v = bytePage.obtain();
-        if (v.isRecycled() && clear) {
+        if (clear) {
+            // Fresh pages come from newInstance() uninitialized, recycled pages may carry stale data.
             Arrays.fill(v.v(), (byte) 0);
         }
         return v;

@@ -610,20 +610,21 @@ public class BigArrays {
 
     /**
      * Allocate a new {@link ByteArray}.
-     * @param size          the initial length of the array
-     * @param clearOnResize whether values should be set to 0 on initialization and resize
+     * @param size  the initial length of the array
+     * @param clear whether values should be set to 0 on initialization and resize
      */
-    public ByteArray newByteArray(long size, boolean clearOnResize) {
+    public ByteArray newByteArray(long size, boolean clear) {
         if (size > PageCacheRecycler.BYTE_PAGE_SIZE) {
             // when allocating big arrays, we want to first ensure we have the capacity by
             // checking with the circuit breaker before attempting to allocate
             adjustBreaker(BigByteArray.estimateRamBytes(size), false);
-            return new BigByteArray(size, this, clearOnResize);
+            return new BigByteArray(size, this, clear);
         } else if (size >= PageCacheRecycler.BYTE_PAGE_SIZE / 2 && recycler != null) {
-            final Recycler.V<byte[]> page = recycler.bytePage(clearOnResize);
-            return validate(new ByteArrayWrapper(this, page.v(), size, page, clearOnResize));
+            final Recycler.V<byte[]> page = recycler.bytePage(clear);
+            return validate(new ByteArrayWrapper(this, page.v(), size, page, clear));
         } else {
-            return validate(new ByteArrayWrapper(this, new byte[(int) size], size, null, clearOnResize));
+            final byte[] buf = clear ? new byte[(int) size] : UnsafeAllocator.newUninitializedByteArray((int) size);
+            return validate(new ByteArrayWrapper(this, buf, size, null, clear));
         }
     }
 

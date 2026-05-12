@@ -73,6 +73,11 @@
 # Required by Apache Arrow memory allocator to access java.nio internals
 --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED
 
+# Required by org.elasticsearch.common.util.UnsafeAllocator to call
+# jdk.internal.misc.Unsafe#allocateUninitializedArray.
+--add-exports=java.base/jdk.internal.misc=org.elasticsearch.server
+--add-opens=java.base/jdk.internal.misc=org.elasticsearch.server
+
 ## heap dumps
 
 # generate a heap dump when an allocation from the Java heap fails; heap dumps
