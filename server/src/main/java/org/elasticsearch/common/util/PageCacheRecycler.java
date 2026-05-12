@@ -104,7 +104,7 @@ public class PageCacheRecycler {
             @Override
             public byte[] newInstance() {
                 // Pages are zero-filled on demand by bytePage(true); skip the JLS zero-fill here.
-                return UnsafeAllocator.newUninitializedByteArray(BYTE_PAGE_SIZE);
+                return UninitializedArrays.newByteArray(BYTE_PAGE_SIZE);
             }
 
             @Override

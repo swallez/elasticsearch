@@ -600,7 +600,7 @@ public class BigArraysTests extends ESTestCase {
 
     public void testNewByteArrayNoClearIsWritable() {
         // clearOnResize=false: contents are undefined, but the array must be fully writable/readable.
-        // Covers both the small path (UnsafeAllocator direct) and the BigByteArray path.
+        // Covers both the small path (UninitializedArrayAllocator direct) and the BigByteArray path.
         int size = randomFrom(
             randomIntBetween(1, PageCacheRecycler.BYTE_PAGE_SIZE / 2 - 1),
             PageCacheRecycler.BYTE_PAGE_SIZE * randomIntBetween(2, 4)
@@ -621,7 +621,7 @@ public class BigArraysTests extends ESTestCase {
     }
 
     public void testBigByteArrayCrossPageGetReturnsCorrectBytes() {
-        // BigByteArray#get fills the cross-page BytesRef from an UnsafeAllocator-allocated scratch buffer.
+        // BigByteArray#get fills the cross-page BytesRef from an UninitializedArrayAllocator-allocated scratch buffer.
         // Even though the scratch is uninitialized, the System.arraycopy calls must fully cover it.
         int size = PageCacheRecycler.BYTE_PAGE_SIZE * 3;
         byte[] expected = new byte[size];

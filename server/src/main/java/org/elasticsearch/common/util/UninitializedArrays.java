@@ -27,17 +27,17 @@ import java.lang.reflect.Field;
  * the running JVM; if either is missing the helper transparently falls back to {@code new byte[n]}
  * so callers never need to branch.
  */
-final class UnsafeAllocator {
+final class UninitializedArrays {
 
-    private static final Logger logger = LogManager.getLogger(UnsafeAllocator.class);
+    private static final Logger logger = LogManager.getLogger(UninitializedArrays.class);
 
     /** Bound MethodHandle of signature {@code (int)byte[]} pointing at {@code Unsafe.allocateUninitializedArray(byte.class, n)}, or null. */
     private static final MethodHandle ALLOCATE_UNINITIALIZED_BYTE_ARRAY = resolve();
 
-    private UnsafeAllocator() {}
+    private UninitializedArrays() {}
 
     /**
-     * Returns {@code true} when {@link #newUninitializedByteArray(int)} will skip the JLS zero-fill via
+     * Returns {@code true} when {@link #newByteArray(int)} will skip the JLS zero-fill via
      * the JDK-internal fast path, and {@code false} when it falls back to {@code new byte[n]} (e.g. the
      * required {@code --add-exports}/{@code --add-opens} flags are missing).
      */
@@ -65,7 +65,7 @@ final class UnsafeAllocator {
      * fast path is available; otherwise the array is zero-initialized as usual. Callers must therefore
      * treat the returned array as containing arbitrary bytes and overwrite before reading.
      */
-    static byte[] newUninitializedByteArray(int size) {
+    static byte[] newByteArray(int size) {
         MethodHandle mh = ALLOCATE_UNINITIALIZED_BYTE_ARRAY;
         if (mh != null) {
             try {

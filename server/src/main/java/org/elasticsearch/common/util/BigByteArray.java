@@ -72,7 +72,7 @@ final class BigByteArray extends AbstractBigByteArray implements ByteArray {
             return false;
         } else {
             // Fully overwritten by the System.arraycopy calls below before being read.
-            ref.bytes = UnsafeAllocator.newUninitializedByteArray(len);
+            ref.bytes = UninitializedArrays.newByteArray(len);
             ref.offset = 0;
             ref.length = BYTE_PAGE_SIZE - indexInPage;
             System.arraycopy(pages[pageIndex], indexInPage, ref.bytes, 0, ref.length);

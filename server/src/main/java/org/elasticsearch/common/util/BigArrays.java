@@ -623,7 +623,7 @@ public class BigArrays {
             final Recycler.V<byte[]> page = recycler.bytePage(clear);
             return validate(new ByteArrayWrapper(this, page.v(), size, page, clear));
         } else {
-            final byte[] buf = clear ? new byte[(int) size] : UnsafeAllocator.newUninitializedByteArray((int) size);
+            final byte[] buf = clear ? new byte[(int) size] : UninitializedArrays.newByteArray((int) size);
             return validate(new ByteArrayWrapper(this, buf, size, null, clear));
         }
     }

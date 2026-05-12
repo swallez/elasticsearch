@@ -63,7 +63,7 @@ abstract class AbstractBigByteArray extends AbstractBigArray {
         } else if (clearOnResize) {
             return new byte[PageCacheRecycler.BYTE_PAGE_SIZE];
         } else {
-            return UnsafeAllocator.newUninitializedByteArray(PageCacheRecycler.BYTE_PAGE_SIZE);
+            return UninitializedArrays.newByteArray(PageCacheRecycler.BYTE_PAGE_SIZE);
         }
     }
 
