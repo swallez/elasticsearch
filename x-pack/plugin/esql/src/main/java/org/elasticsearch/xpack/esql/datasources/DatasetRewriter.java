@@ -22,9 +22,11 @@ import org.elasticsearch.logging.Logger;
 import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.xpack.esql.VerificationException;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.datasources.metadata.DataSource;
 import org.elasticsearch.xpack.esql.datasources.metadata.DataSourceMetadata;
 import org.elasticsearch.xpack.esql.datasources.metadata.DataSourceSetting;
+import org.elasticsearch.xpack.esql.plan.IndexPattern;
 import org.elasticsearch.xpack.esql.plan.logical.Fork;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
@@ -68,11 +70,11 @@ public final class DatasetRewriter {
      * since {@link DatasetMetadata#ESQL_EXTERNAL_DATASOURCES_FEATURE_FLAG} gates the CRUD layer
      * that puts datasets into cluster state, the no-datasets check is the natural off-switch.
      *
-     * <p>Throws {@link VerificationException} for: heterogeneous FROM (datasets + non-datasets),
-     * non-{@code STANDARD} {@link IndexMode} on a dataset, METADATA fields on a dataset, or
-     * {@code UnionAll} branch-cap exceeded. Designed to run once on the parsed plan before
-     * pre-analysis (so the analyzer sees a uniform {@code UnresolvedExternalRelation} tree
-     * regardless of whether the user wrote {@code FROM <dataset>} or inline {@code EXTERNAL}).
+     * <p>Throws {@link VerificationException} for: non-{@code STANDARD} {@link IndexMode} on a
+     * dataset, METADATA fields on a dataset, or {@code UnionAll} branch-cap exceeded. Designed
+     * to run once on the parsed plan before pre-analysis (so the analyzer sees a uniform
+     * {@code UnresolvedExternalRelation} tree regardless of whether the user wrote
+     * {@code FROM <dataset>} or inline {@code EXTERNAL}).
      */
     public static LogicalPlan rewrite(LogicalPlan parsed, ProjectMetadata projectMetadata, IndexNameExpressionResolver iner) {
         if (projectMetadata == null) {
@@ -158,36 +160,51 @@ public final class DatasetRewriter {
             throw new VerificationException("METADATA fields are not supported on datasets; dataset(s) requested: " + datasetNames);
         }
         if (nonDatasetNames.isEmpty() == false) {
-            // Counts only in the user-facing message (names may be unreadable to the caller); full
-            // names go to DEBUG for operator triage. Rejection removed by heterogeneous FROM.
+            // Heterogeneous FROM: indices and datasets in the same FROM clause.
+            // Build UnionAll(UnresolvedRelation(indices), UnresolvedExternalRelation(ds1), UnresolvedExternalRelation(ds2), ...).
             logger.debug(
-                "DatasetRewriter rejecting mixed FROM: pattern=[{}] datasets={} non-datasets={}",
+                "DatasetRewriter building heterogeneous UnionAll: pattern=[{}] datasets={} non-datasets={}",
                 relation.indexPattern().indexPattern(),
                 datasetNames,
                 nonDatasetNames
             );
-            throw new VerificationException(
-                "FROM mixing datasets and non-datasets is not supported; requested mix: "
-                    + nonDatasetNames.size()
-                    + " non-dataset(s) and "
-                    + datasetNames.size()
-                    + " dataset(s)"
-            );
-        }
-        List<LogicalPlan> children = new ArrayList<>(datasetNames.size());
-        for (String name : datasetNames) {
-            Dataset dataset = datasets.get(name);
-            DataSource parent = dataSources.get(dataset.dataSource().getName());
-            // DataSourceService.deleteDataSources rejects (409) on orphans, so a null parent here
-            // means a broken-invariant state (e.g. corrupt cluster-state restore) — throw with context.
-            if (parent == null) {
-                throw new IllegalStateException(
-                    "dataset [" + name + "] references unknown data source [" + dataset.dataSource().getName() + "]"
+            int totalBranches = 1 + datasetNames.size(); // 1 index branch + one per dataset
+            if (Fork.exceedsMaxBranches(totalBranches)) {
+                throw new VerificationException(
+                    "FROM ["
+                        + relation.indexPattern().indexPattern()
+                        + "] matched "
+                        + datasetNames.size()
+                        + " dataset(s) and "
+                        + nonDatasetNames.size()
+                        + " non-dataset index/alias(es); total "
+                        + totalBranches
+                        + " branches exceeds the current limit of "
+                        + Fork.MAX_BRANCHES
+                        + " per FROM. Narrow the pattern, exclude some datasets, or split into multiple queries."
                 );
             }
-            Map<String, Object> merged = mergeSettings(parent, dataset);
-            Literal path = Literal.keyword(relation.source(), dataset.resource());
-            children.add(new UnresolvedExternalRelation(relation.source(), path, merged));
+            List<LogicalPlan> branches = new ArrayList<>(totalBranches);
+            // Index branch: concrete resolved non-dataset names, joined for the index resolver.
+            branches.add(
+                new UnresolvedRelation(
+                    relation.source(),
+                    new IndexPattern(relation.source(), String.join(",", nonDatasetNames)),
+                    relation.frozen(),
+                    List.of(),
+                    relation.indexMode(),
+                    null
+                )
+            );
+            for (String name : datasetNames) {
+                branches.add(buildDatasetBranch(name, datasets, dataSources, relation.source()));
+            }
+            return new UnionAll(relation.source(), branches, List.of());
+        }
+        // Dataset-only case: all resolved names are datasets.
+        List<LogicalPlan> children = new ArrayList<>(datasetNames.size());
+        for (String name : datasetNames) {
+            children.add(buildDatasetBranch(name, datasets, dataSources, relation.source()));
         }
         if (children.size() == 1) {
             return children.get(0);
@@ -232,6 +249,21 @@ public final class DatasetRewriter {
             }
         }
         return false;
+    }
+
+    private static LogicalPlan buildDatasetBranch(String name, DatasetMetadata datasets, DataSourceMetadata dataSources, Source source) {
+        Dataset dataset = datasets.get(name);
+        DataSource parent = dataSources.get(dataset.dataSource().getName());
+        // DataSourceService.deleteDataSources rejects (409) on orphans, so a null parent here
+        // means a broken-invariant state (e.g. corrupt cluster-state restore) — throw with context.
+        if (parent == null) {
+            throw new IllegalStateException(
+                "dataset [" + name + "] references unknown data source [" + dataset.dataSource().getName() + "]"
+            );
+        }
+        Map<String, Object> merged = mergeSettings(parent, dataset);
+        Literal path = Literal.keyword(source, dataset.resource());
+        return new UnresolvedExternalRelation(source, path, merged);
     }
 
     /**
