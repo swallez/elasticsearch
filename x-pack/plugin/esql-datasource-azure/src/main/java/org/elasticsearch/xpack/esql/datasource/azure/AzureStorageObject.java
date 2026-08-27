@@ -324,8 +324,12 @@ public final class AzureStorageObject extends AbstractMeteredStorageObject {
                 })
                 .toFuture();
         } catch (RuntimeException e) {
-            // Assembly-time throw from Reactor operator construction. No request was issued,
-            // so counters are not updated.
+            // Assembly-time throw from Reactor operator construction. Nothing has subscribed yet --
+            // Reactor turns subscribe-time throws into an onError signal, which surfaces below as a
+            // failed future -- so no chunk can be in flight into drb and closing it here is safe.
+            // The guard must stay this narrow: moving a post-subscribe step inside the try would turn
+            // this close into a use-after-free on a buffer the chain is still writing into.
+            // No request was issued, so counters are not updated.
             drb.close();
             listener.onFailure(mapReadFailure("Failed to read bytes from", e));
             return;

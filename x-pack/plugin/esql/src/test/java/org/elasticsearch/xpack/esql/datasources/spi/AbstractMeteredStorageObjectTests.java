@@ -14,9 +14,11 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class AbstractMeteredStorageObjectTests extends ESTestCase {
@@ -136,5 +138,43 @@ public class AbstractMeteredStorageObjectTests extends ESTestCase {
 
         assertSame(boom, expectThrows(RuntimeException.class, () -> obj.deliverRead(throwing, buffer, System.nanoTime())));
         assertTrue("buffer must be closed when delivery throws", closed.get());
+    }
+
+    /**
+     * A throw out of {@code deliverRead} (i.e. out of {@code listener.onResponse}) is captured by
+     * {@link CompletableFuture} into the dependent future rather than being rethrown at the caller of
+     * {@code onReadComplete} -- even when the source future is already complete and the handler
+     * therefore runs inline. Callers of {@code readBytesAsync} never see it, so wrapping
+     * {@code onReadComplete} in a try/catch would be dead code that could only produce a second close
+     * and a second terminal listener call.
+     */
+    public void testOnReadCompleteCapturesDeliveryThrowInsteadOfPropagating() {
+        TestStorageObject obj = new TestStorageObject();
+        AtomicInteger closeCount = new AtomicInteger();
+        DirectReadBuffer buffer = new DirectReadBuffer(ByteBuffer.allocate(16), closeCount::incrementAndGet);
+        RuntimeException boom = new RuntimeException("listener boom");
+        AtomicInteger failures = new AtomicInteger();
+
+        ActionListener<DirectReadBuffer> throwing = new ActionListener<>() {
+            @Override
+            public void onResponse(DirectReadBuffer b) {
+                throw boom;
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                failures.incrementAndGet();
+            }
+        };
+
+        CompletableFuture<DirectReadBuffer> returned = AbstractMeteredStorageObject.onReadComplete(
+            CompletableFuture.completedFuture(buffer), // already complete: the handler runs on this thread
+            (b, error) -> obj.deliverRead(throwing, b, System.nanoTime())
+        );
+
+        assertTrue("delivery throw must land in the returned future", returned.isCompletedExceptionally());
+        assertSame(boom, expectThrows(CompletionException.class, returned::join).getCause());
+        assertEquals("buffer must be closed exactly once", 1, closeCount.get());
+        assertEquals("listener must not get a second terminal call", 0, failures.get());
     }
 }
