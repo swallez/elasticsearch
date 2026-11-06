@@ -200,9 +200,13 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
     }
 
     protected void createBatchIndex(String index, String... mapping) {
+        createBatchIndex(index, Settings.builder(), mapping);
+    }
+
+    protected void createBatchIndex(String index, Settings.Builder settings, String... mapping) {
         assertAcked(
             indicesAdmin().prepareCreate(index)
-                .setSettings(indexModeSettings().put(IndexSettings.BATCH_INDEXING.getKey(), true))
+                .setSettings(indexModeSettings().put(settings.build()).put(IndexSettings.BATCH_INDEXING.getKey(), true))
                 .setMapping(mapping)
         );
     }
@@ -635,6 +639,47 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
         assertCount(index, 0);
     }
 
+    private long refreshCount(String index) {
+        return indicesAdmin().prepareStats(index).setRefresh(true).get().getPrimaries().getRefresh().getTotal();
+    }
+
+    /**
+     * The refresh of a request is done once for the whole stream, and not once per bulk request that is created for each record batch
+     * (with {@code wait_for}, every bulk request would wait for a refresh). The documents of all shards are visible when the
+     * response is received, whatever the shards that the last record batch was written to.
+     */
+    public void testRefreshIsDoneOnce() throws Exception {
+        int shards = 3;
+        int recordBatches = 6;
+        int rows = 60;
+        byte[] payload = rowsStream(recordBatches, rows);
+
+        for (String refresh : new String[] { "true", "wait_for", "false" }) {
+            String index = "arrow_refresh_" + refresh;
+            // Without automatic refresh, only the refresh of the request can make documents visible
+            createBatchIndex(
+                index,
+                Settings.builder().put("index.number_of_shards", shards).put("index.refresh_interval", "-1"),
+                "ints",
+                "type=integer",
+                "strings",
+                "type=keyword"
+            );
+            long before = refreshCount(index);
+
+            assertThat(failures(post(index, payload, Map.of("refresh", refresh))), empty());
+
+            long refreshes = refreshCount(index) - before;
+            if (refresh.equals("false")) {
+                assertThat("no refresh was requested", refreshes, equalTo(0L));
+            } else {
+                // One refresh of the shards. A refresh for each of the record batches would be at least six times more.
+                assertThat("refreshes with refresh=" + refresh, refreshes, lessThanOrEqualTo(2L * shards));
+                assertCount(index, (long) recordBatches * rows);
+            }
+        }
+    }
+
     public void testRejectedRequests() throws Exception {
         String index = "arrow_rejected";
         createBatchIndex(index);
@@ -644,6 +689,9 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
 
         // No target index, neither in the path nor in the data
         assertBadRequest(expectFailure(() -> post(null, idsStream("a"))), "No target index");
+
+        // Invalid refresh policy, rejected before any data is read
+        assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("refresh", "nope"))), "Unknown value for refresh");
 
         // Invalid operation type
         assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("op_type", "delete"))), "[op_type] must be");

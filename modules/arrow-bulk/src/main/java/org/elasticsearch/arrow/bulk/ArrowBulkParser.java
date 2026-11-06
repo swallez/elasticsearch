@@ -69,7 +69,6 @@ final class ArrowBulkParser implements Releasable {
      * @param requireDataStream whether the target must be a data stream
      * @param timeout the timeout of bulk requests
      * @param waitForActiveShards the number of active shard copies required to proceed, or {@code null} for the default
-     * @param refresh the refresh policy of bulk requests, or {@code null} for the default
      * @param paramsUsed the REST request parameters, for telemetry
      */
     record Params(
@@ -80,15 +79,16 @@ final class ArrowBulkParser implements Releasable {
         boolean requireDataStream,
         TimeValue timeout,
         @Nullable ActiveShardCount waitForActiveShards,
-        @Nullable String refresh,
         Set<String> paramsUsed
     ) {}
 
     /**
-     * A bulk request, and the number of the Arrow row that each of its items comes from (counted from the start of the
-     * stream), to report failures in terms of what the client sent.
+     * A bulk request, the index (or alias, or data stream) it targets, and the number of the Arrow row that each of its items comes
+     * from (counted from the start of the stream), to report failures in terms of what the client sent.
+     * <p>
+     * Bulk requests don't have a refresh policy: the refresh requested for the stream is done once, when all the bulk requests have run.
      */
-    record PendingBulk(BulkRequest request, long[] rowNumbers) {}
+    record PendingBulk(BulkRequest request, String index, long[] rowNumbers) {}
 
     private final Params params;
     private final BooleanSupplier batchIndexingSupported;
@@ -227,7 +227,7 @@ final class ArrowBulkParser implements Releasable {
                 batch.close();
                 throw e;
             }
-            bulkConsumer.accept(new PendingBulk(bulk, rowNumbers));
+            bulkConsumer.accept(new PendingBulk(bulk, index, rowNumbers));
         }
     }
 
@@ -287,9 +287,6 @@ final class ArrowBulkParser implements Releasable {
         bulk.timeout(params.timeout());
         if (params.waitForActiveShards() != null) {
             bulk.waitForActiveShards(params.waitForActiveShards());
-        }
-        if (params.refresh() != null) {
-            bulk.setRefreshPolicy(params.refresh());
         }
         bulk.requestParamsUsed(params.paramsUsed());
         return bulk;

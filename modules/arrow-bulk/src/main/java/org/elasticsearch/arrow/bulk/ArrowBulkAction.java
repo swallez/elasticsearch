@@ -20,11 +20,13 @@ import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.DocWriteRequest;
+import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
 import org.elasticsearch.action.bulk.BatchIndexingEnabled;
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkShardRequest;
 import org.elasticsearch.action.bulk.ShardBatchIndexer;
 import org.elasticsearch.action.support.ActiveShardCount;
+import org.elasticsearch.action.support.WriteRequest;
 import org.elasticsearch.arrow.Arrow;
 import org.elasticsearch.client.internal.node.NodeClient;
 import org.elasticsearch.cluster.service.ClusterService;
@@ -47,7 +49,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.elasticsearch.rest.RestRequest.Method.POST;
 import static org.elasticsearch.rest.RestRequest.Method.PUT;
@@ -137,12 +141,16 @@ public class ArrowBulkAction extends BaseRestHandler {
             request.paramAsBoolean(DocWriteRequest.REQUIRE_DATA_STREAM, false),
             request.paramAsTime("timeout", BulkShardRequest.DEFAULT_TIMEOUT),
             waitForActiveShards == null ? null : ActiveShardCount.parseString(waitForActiveShards),
-            request.param("refresh"),
             request.params().keySet()
         );
 
-        // Note: validation of the refresh parameter is deferred to BulkRequest, when the first record batch is read.
-        return new ChunkHandler(request, client, params);
+        // Refreshing after every bulk request of a stream is very costly (with wait_for, each of them waits for a refresh), so the
+        // refresh is done once, at the end. It's validated now, to reject the request before reading any data.
+        String refresh = request.param("refresh");
+        WriteRequest.RefreshPolicy refreshPolicy = refresh == null
+            ? WriteRequest.RefreshPolicy.NONE
+            : WriteRequest.RefreshPolicy.parse(refresh);
+        return new ChunkHandler(request, client, params, refreshPolicy);
     }
 
     /**
@@ -166,6 +174,15 @@ public class ArrowBulkAction extends BaseRestHandler {
          */
         private final ArrayDeque<ArrowBulkParser.PendingBulk> pendingBulks = new ArrayDeque<>();
 
+        /** Whether to refresh the written indices once all bulk requests have run, to make the documents visible to searches. */
+        private final WriteRequest.RefreshPolicy refreshPolicy;
+
+        /**
+         * The indices that were written to, to refresh. An explicit refresh of the indices covers all their shards, which the last bulk
+         * request with a refresh policy wouldn't: it may not have written to every shard that earlier bulk requests wrote to.
+         */
+        private final Set<String> writtenIndices = new LinkedHashSet<>();
+
         /** Items that failed, collected from the bulk responses to build the Arrow response. */
         private final List<ItemFailure> failures = new ArrayList<>();
 
@@ -173,9 +190,10 @@ public class ArrowBulkAction extends BaseRestHandler {
         private boolean shortCircuited;
         private boolean lastChunk;
 
-        ChunkHandler(RestRequest request, NodeClient client, ArrowBulkParser.Params params) {
+        ChunkHandler(RestRequest request, NodeClient client, ArrowBulkParser.Params params, WriteRequest.RefreshPolicy refreshPolicy) {
             this.request = request;
             this.client = client;
+            this.refreshPolicy = refreshPolicy;
             this.parser = new ArrowBulkParser(
                 params,
                 recycler,
@@ -235,13 +253,14 @@ public class ArrowBulkAction extends BaseRestHandler {
             ArrowBulkParser.PendingBulk next = pendingBulks.poll();
             if (next == null) {
                 if (lastChunk) {
-                    sendResponse();
+                    refreshThenSendResponse();
                 } else {
                     request.contentStream().next();
                 }
                 return;
             }
 
+            writtenIndices.add(next.index());
             // Hands the batch over to the bulk action, that releases it.
             client.bulk(next.request(), new ActionListener<>() {
                 @Override
@@ -259,6 +278,16 @@ public class ArrowBulkAction extends BaseRestHandler {
                     fail(e);
                 }
             });
+        }
+
+        /** Refreshes the indices that were written to if the request asked for it, and then sends the response. */
+        private void refreshThenSendResponse() {
+            if (refreshPolicy == WriteRequest.RefreshPolicy.NONE || writtenIndices.isEmpty()) {
+                sendResponse();
+                return;
+            }
+            var refresh = new RefreshRequest(writtenIndices.toArray(String[]::new));
+            client.admin().indices().refresh(refresh, ActionListener.wrap(response -> sendResponse(), this::fail));
         }
 
         private void sendResponse() {
