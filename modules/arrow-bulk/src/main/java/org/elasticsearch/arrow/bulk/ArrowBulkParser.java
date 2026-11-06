@@ -13,6 +13,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -24,14 +25,18 @@ import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
@@ -41,9 +46,11 @@ import java.util.function.Consumer;
  * Parses an Arrow IPC stream and turns every record batch into bulk requests carrying a pre-built {@link EscfBatch}, so that
  * documents are indexed through the columnar indexing path without being converted to JSON.
  * <p>
- * Bulk requests can carry only one pre-built batch, so a record batch becomes one bulk request, or several if its rows target
- * different indices (see {@link #INDEX}). Record batches are never merged, which keeps memory usage proportional to the size
- * of a record batch rather than to the size of the whole stream.
+ * Bulk requests can carry only one pre-built batch, so there is one bulk request per target index (see {@link #INDEX}). Every bulk
+ * request has a fixed cost (it waits for the translog to be synced, on every shard that it writes to), so small record batches are
+ * not sent one by one: their rows are accumulated, per target, and sent when there are {@link Params#bulkRows()} rows, when the data
+ * that was accumulated for all the targets reaches {@link Params#bulkBytes()}, or when the stream ends. A record batch is never split, so a
+ * record batch that is bigger than this is sent as is. Memory usage is bounded by the target size, and not by the size of the stream.
  * <p>
  * The columns of the Arrow table are the fields of the documents, except for the following ones that carry bulk metadata
  * and are not part of the documents:
@@ -60,6 +67,23 @@ final class ArrowBulkParser implements Releasable {
     static final String ACTION = "_bulk_action";
 
     /**
+     * The default number of rows after which the rows accumulated for a target are sent ({@code bulk_rows}). With the default
+     * translog durability, a bulk request waits for the translog to be synced, so the throughput of small bulk requests is limited by
+     * that: in a benchmark of 12 columns, record batches of 1000 rows were indexed at about 73k rows/s, 10k rows at 259k, and 50k rows
+     * at 322k. Above 10k rows, the cost of the rows dominates.
+     */
+    static final int DEFAULT_BULK_ROWS = 10_000;
+
+    /**
+     * The default (approximate, it's the size of the Arrow buffers) number of bytes after which everything that was accumulated is
+     * sent ({@code bulk_bytes}), to bound the memory used by the rows that wait to be sent, also when they go to many different targets.
+     */
+    static final long DEFAULT_BULK_BYTES = 8L * 1024 * 1024;
+
+    /** The highest {@code bulk_bytes}: it bounds the memory that a request can use for rows that wait to be sent. */
+    static final long MAX_BULK_BYTES = 64L * 1024 * 1024;
+
+    /**
      * Parameters of the bulk requests that are created.
      *
      * @param defaultIndex the target of rows that don't have an {@code _index} value
@@ -69,6 +93,8 @@ final class ArrowBulkParser implements Releasable {
      * @param requireDataStream whether the target must be a data stream
      * @param timeout the timeout of bulk requests
      * @param waitForActiveShards the number of active shard copies required to proceed, or {@code null} for the default
+     * @param bulkRows the number of rows of a target after which they are sent as a bulk request
+     * @param bulkBytes the size (of the Arrow buffers) of everything that waits, after which it is all sent
      * @param paramsUsed the REST request parameters, for telemetry
      */
     record Params(
@@ -79,6 +105,8 @@ final class ArrowBulkParser implements Releasable {
         boolean requireDataStream,
         TimeValue timeout,
         @Nullable ActiveShardCount waitForActiveShards,
+        int bulkRows,
+        long bulkBytes,
         Set<String> paramsUsed
     ) {}
 
@@ -103,6 +131,9 @@ final class ArrowBulkParser implements Releasable {
     private int indexColumn = -1;
     private BitSet valueColumns;
     private long rowsSoFar = 0;
+
+    /** The rows that wait to be sent, by target index. */
+    private final Map<String, Accumulator> accumulators = new LinkedHashMap<>();
 
     /**
      * @param batchIndexingSupported whether columnar indexing can be used by the cluster
@@ -143,11 +174,21 @@ final class ArrowBulkParser implements Releasable {
      * @param lastData whether this is the end of the stream
      */
     int parse(BytesReference data, boolean lastData) throws IOException {
-        return arrowParser.parse(data, lastData);
+        int consumed = arrowParser.parse(data, lastData);
+        if (lastData) {
+            // The end of the stream: nothing will complete the rows that wait to be sent. A stream with an incomplete message fails
+            // in the parser above, and these rows are dropped with the request.
+            for (Accumulator accumulator : new ArrayList<>(accumulators.values())) {
+                flush(accumulator);
+            }
+        }
+        return consumed;
     }
 
     @Override
     public void close() {
+        Releasables.close(accumulators.values());
+        accumulators.clear();
         try {
             arrowParser.close();
         } catch (IOException e) {
@@ -197,37 +238,104 @@ final class ArrowBulkParser implements Releasable {
         long firstRow = rowsSoFar;
         rowsSoFar += rowCount;
 
+        long recordBatchBytes = 0;
+        for (int column = valueColumns.nextSetBit(0); column >= 0; column = valueColumns.nextSetBit(column + 1)) {
+            recordBatchBytes += schemaRoot.getVector(column).getBufferSize();
+        }
+
         for (var entry : rowsByIndex.entrySet()) {
-            String index = entry.getKey();
             int[] rows = entry.getValue(); // null if all the rows go the same index
             int count = rows == null ? rowCount : rows.length;
+            Accumulator accumulator = accumulators.computeIfAbsent(entry.getKey(), Accumulator::new);
+            accumulator.append(dictionaries, rows, count, firstRow, recordBatchBytes * count / rowCount);
+        }
 
-            EscfBatch batch = converter.convert(schemaRoot, dictionaries, valueColumns, rows);
-            final BulkRequest bulk = newBulkRequest();
-            final long[] rowNumbers = new long[count];
-            try {
-                for (int i = 0; i < count; i++) {
-                    int row = rows == null ? i : rows[i];
-                    rowNumbers[i] = firstRow + row;
-                    IndexRequest request = new IndexRequest(index).opType(params.opType())
-                        .routing(params.routing())
-                        .setRequireAlias(params.requireAlias())
-                        .setRequireDataStream(params.requireDataStream())
-                        .setIncludeSourceOnError(false);
-                    String id = idColumn < 0 ? null : converter.stringValue(schemaRoot.getVector(idColumn), row, dictionaries);
-                    if (id != null) {
-                        request.id(id);
-                    }
-                    request.indexSource().setSourceRow(batch, i, XContentType.JSON);
-                    bulk.add(request);
-                }
-                // The bulk request owns the batch from here on
-                bulk.setPreBuiltBatches(Map.of(index, batch));
-            } catch (RuntimeException e) {
-                batch.close();
-                throw e;
+        // Everything is sent when too much waits, otherwise only the targets that have enough rows
+        long accumulatedBytes = 0;
+        for (Accumulator accumulator : accumulators.values()) {
+            accumulatedBytes += accumulator.bytes;
+        }
+        for (Accumulator accumulator : new ArrayList<>(accumulators.values())) {
+            if (accumulatedBytes >= params.bulkBytes() || accumulator.rows() >= params.bulkRows()) {
+                flush(accumulator);
             }
-            bulkConsumer.accept(new PendingBulk(bulk, index, rowNumbers));
+        }
+    }
+
+    /** Sends the rows that were accumulated for a target, as a bulk request with a single pre-built batch. */
+    private void flush(Accumulator accumulator) {
+        accumulators.remove(accumulator.index);
+        int rows = accumulator.rows();
+        // The batch owns the columns from here on, there is nothing left to release in the accumulator
+        EscfBatch batch = accumulator.conversion.build();
+        final BulkRequest bulk = newBulkRequest();
+        try {
+            for (int i = 0; i < rows; i++) {
+                IndexRequest request = new IndexRequest(accumulator.index).opType(params.opType())
+                    .routing(params.routing())
+                    .setRequireAlias(params.requireAlias())
+                    .setRequireDataStream(params.requireDataStream())
+                    .setIncludeSourceOnError(false);
+                String id = accumulator.ids == null ? null : accumulator.ids.get(i);
+                if (id != null) {
+                    request.id(id);
+                }
+                request.indexSource().setSourceRow(batch, i, XContentType.JSON);
+                bulk.add(request);
+            }
+            // The bulk request owns the batch from here on
+            bulk.setPreBuiltBatches(Map.of(accumulator.index, batch));
+        } catch (RuntimeException e) {
+            batch.close();
+            throw e;
+        }
+        bulkConsumer.accept(new PendingBulk(bulk, accumulator.index, Arrays.copyOf(accumulator.rowNumbers, rows)));
+    }
+
+    /** The rows going to a target index, accumulated from several record batches until they are sent. */
+    private final class Accumulator implements Releasable {
+        final String index;
+        final ArrowToEscf.Conversion conversion = converter.newConversion();
+        /** The number of the row in the stream, for each row. */
+        long[] rowNumbers = new long[256];
+        /** The id of each row, or {@code null} if there is no {@code _id} column. */
+        final List<String> ids;
+        /** The approximate size of what was accumulated, in bytes. */
+        long bytes;
+
+        Accumulator(String index) {
+            this.index = index;
+            this.ids = idColumn < 0 ? null : new ArrayList<>();
+        }
+
+        int rows() {
+            return conversion.rowCount();
+        }
+
+        /**
+         * Appends the rows of the current record batch.
+         *
+         * @param rows the rows of the record batch, or {@code null} for all of them
+         * @param firstRow the number in the stream of the first row of the record batch
+         * @param appendedBytes the share of the size of the record batch that is for these rows
+         */
+        void append(Map<Long, Dictionary> dictionaries, @Nullable int[] rows, int count, long firstRow, long appendedBytes) {
+            int before = rows();
+            rowNumbers = ArrayUtil.grow(rowNumbers, before + count);
+            for (int i = 0; i < count; i++) {
+                int row = rows == null ? i : rows[i];
+                rowNumbers[before + i] = firstRow + row;
+                if (ids != null) {
+                    ids.add(converter.stringValue(schemaRoot.getVector(idColumn), row, dictionaries));
+                }
+            }
+            conversion.append(schemaRoot, dictionaries, valueColumns, rows);
+            bytes += appendedBytes;
+        }
+
+        @Override
+        public void close() {
+            conversion.close();
         }
     }
 

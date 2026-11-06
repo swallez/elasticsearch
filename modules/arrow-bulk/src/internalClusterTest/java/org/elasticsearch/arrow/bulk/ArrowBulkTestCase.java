@@ -85,6 +85,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
@@ -132,6 +133,8 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
     public static class HoldBulksPlugin extends Plugin implements ActionPlugin {
         static volatile boolean holding = false;
         static final Queue<Runnable> held = new ConcurrentLinkedQueue<>();
+        /** The number of bulk requests that were sent to the bulk action, to check how many are made from the record batches. */
+        static final AtomicInteger bulkRequests = new AtomicInteger();
 
         /** Lets the bulk requests that are held continue. */
         static void releaseAll() {
@@ -157,6 +160,9 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
                     ActionListener<Response> listener,
                     ActionFilterChain<Request, Response> chain
                 ) {
+                    if (TransportBulkAction.NAME.equals(action)) {
+                        bulkRequests.incrementAndGet();
+                    }
                     if (holding && TransportBulkAction.NAME.equals(action)) {
                         held.add(() -> chain.proceed(task, action, request, listener));
                     } else {
@@ -394,7 +400,9 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
             root.setRowCount(2);
         });
 
+        HoldBulksPlugin.bulkRequests.set(0);
         assertThat(failures(post(index, payload)), equalTo(List.of(new Failure(1, 409), new Failure(2, 409))));
+        assertThat("both record batches are sent in a single bulk request", HoldBulksPlugin.bulkRequests.get(), equalTo(1));
         assertCountAfterConflicts(index, 4);
     }
 
@@ -693,6 +701,16 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
         // Invalid refresh policy, rejected before any data is read
         assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("refresh", "nope"))), "Unknown value for refresh");
 
+        // Invalid sizes of bulk requests
+        assertBadRequest(
+            expectFailure(() -> post(index, idsStream("a"), Map.of("bulk_rows", "0"))),
+            "[bulk_rows] must be greater than zero"
+        );
+        assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("bulk_rows", "abc"))), "bulk_rows");
+        assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("bulk_bytes", "0"))), "[bulk_bytes] must be between");
+        assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("bulk_bytes", "1gb"))), "[bulk_bytes] must be between");
+        assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("bulk_bytes", "xyz"))), "bulk_bytes");
+
         // Invalid operation type
         assertBadRequest(expectFailure(() -> post(index, idsStream("a"), Map.of("op_type", "delete"))), "[op_type] must be");
 
@@ -742,20 +760,29 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
 
     /**
      * A record batch that is invalid after other record batches were read: the first bulk request may already have been
-     * executed (depending on how the data was chunked), and everything that remains must be released.
+     * executed (depending on how the data was chunked), and everything that remains must be released. The rows of the first record
+     * batches wait to be sent, until there are enough of them.
      */
     public void testFailureInSecondRecordBatchDoesNotLeak() throws Exception {
-        createBatchIndex("arrow_leak_batches");
-        long baseline = Arrow.rootAllocator().getAllocatedMemory();
+        // The rows of the first record batch wait in memory when the second one fails
+        assertFailureInSecondRecordBatchDoesNotLeak(ArrowBulkParser.DEFAULT_BULK_ROWS);
+        // The first record batch was sent: it's a bulk request that was created but wasn't executed yet when the second one fails
+        assertFailureInSecondRecordBatchDoesNotLeak(1);
+    }
 
+    private void assertFailureInSecondRecordBatchDoesNotLeak(int bulkRows) throws Exception {
+        String index = "arrow_leak_batches_" + bulkRows;
+        createBatchIndex(index);
+        long baseline = Arrow.rootAllocator().getAllocatedMemory();
         int rows = 10;
+
         // The second record batch has a row without a target index, and the request path doesn't provide a default
         byte[] payload = arrowStream(new Schema(List.of(stringField(ArrowBulkAction.INDEX), intField("ints"))), 3, (root, batch) -> {
             for (int row = 0; row < rows; row++) {
                 if (batch == 1 && row == rows / 2) {
                     ((VarCharVector) root.getVector(0)).setNull(row);
                 } else {
-                    ((VarCharVector) root.getVector(0)).setSafe(row, new Text("arrow_leak_batches"));
+                    ((VarCharVector) root.getVector(0)).setSafe(row, new Text(index));
                 }
                 ((IntVector) root.getVector(1)).setSafe(row, batch * rows + row);
             }
@@ -763,12 +790,13 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
         });
 
         for (boolean chunked : new boolean[] { false, true }) {
-            assertBadRequest(expectFailure(() -> post(null, payload, Map.of("refresh", "true"), chunked)), "No target index");
+            var params = Map.of("refresh", "true", "bulk_rows", String.valueOf(bulkRows));
+            assertBadRequest(expectFailure(() -> post(null, payload, params, chunked)), "No target index");
             assertNoLeaks(baseline);
         }
 
         // The third record batch was never read. The first one was indexed, or not, depending on how the request was received.
-        long indexed = count("arrow_leak_batches");
+        long indexed = count(index);
         assertThat(indexed % rows, equalTo(0L));
         assertThat(indexed, lessThanOrEqualTo(2L * rows));
     }
@@ -847,6 +875,102 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
     }
 
     // ---------------------------------------------------------------------------------------------------------------------------------
+    // Coalescing of record batches
+
+    /**
+     * The rows of small record batches are sent together, in bulk requests of about {@code bulk_rows} rows, or when the stream ends.
+     */
+    public void testSmallRecordBatchesAreCoalesced() throws Exception {
+        String index = "arrow_coalesce";
+        createBatchIndex(index);
+
+        // 25 record batches of 40 rows: rows are sent after the 10th and the 20th record batch (400 rows), and at the end of the stream
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(index, rowsStream(25, 40), Map.of("refresh", "true", "bulk_rows", "400"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(3));
+        assertCount(index, 1_000);
+
+        // With the default, fewer rows than the limit are sent when the stream ends
+        String small = "arrow_coalesce_small";
+        createBatchIndex(small);
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(small, rowsStream(50, 100))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(1));
+        assertCount(small, 5_000);
+    }
+
+    /** A record batch is never split, even if it has more rows than {@code bulk_rows}. */
+    public void testRecordBatchBiggerThanBulkRowsIsNotSplit() throws Exception {
+        String index = "arrow_coalesce_big";
+        createBatchIndex(index);
+
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(index, rowsStream(1, 3_500), Map.of("refresh", "true", "bulk_rows", "1000"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(1));
+        assertCount(index, 3_500);
+    }
+
+    /** What waits is sent when it is bigger than {@code bulk_bytes}, however few rows there are. */
+    public void testBulkBytesParameter() throws Exception {
+        String index = "arrow_coalesce_bytes";
+        createBatchIndex(index);
+
+        // With the smallest value, every record batch is sent as soon as it is read
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(index, rowsStream(10, 100), Map.of("refresh", "true", "bulk_bytes", "1b"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(10));
+        assertCount(index, 1_000);
+
+        // Sizes with units are accepted, and a limit that isn't reached doesn't send anything before the end of the stream
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(index, rowsStream(10, 100), Map.of("refresh", "true", "bulk_bytes", "60mb"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(1));
+        assertCount(index, 2_000);
+    }
+
+    /** The rows of each target are accumulated across record batches: one bulk request per index for the stream. */
+    public void testIndexColumnAcrossRecordBatches() throws Exception {
+        createBatchIndex("arrow_coalesce_a");
+        createBatchIndex("arrow_coalesce_b");
+
+        int rows = 10;
+        byte[] payload = arrowStream(new Schema(List.of(stringField(ArrowBulkAction.INDEX), intField("ints"))), 3, (root, batch) -> {
+            for (int row = 0; row < rows; row++) {
+                // The index alternates for every row, and the first one of each record batch is different
+                String index = (row + batch) % 2 == 0 ? "arrow_coalesce_a" : "arrow_coalesce_b";
+                ((VarCharVector) root.getVector(0)).setSafe(row, new Text(index));
+                ((IntVector) root.getVector(1)).setSafe(row, batch * rows + row);
+            }
+            root.setRowCount(rows);
+        });
+
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(null, payload)), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(2));
+        assertCount("arrow_coalesce_a", 15);
+        assertCount("arrow_coalesce_b", 15);
+    }
+
+    /** Rows with the same id are indexed in the order of the stream, also when they are in different record batches. */
+    public void testCoalescingKeepsRowOrder() throws Exception {
+        String index = "arrow_coalesce_order";
+        createBatchIndex(index);
+
+        // The same document in three record batches, with the number of the record batch as value
+        byte[] payload = arrowStream(new Schema(List.of(stringField(ArrowBulkAction.ID), intField("ints"))), 3, (root, batch) -> {
+            ((VarCharVector) root.getVector(0)).setSafe(0, new Text("x"));
+            ((IntVector) root.getVector(1)).setSafe(0, batch);
+            root.setRowCount(1);
+        });
+
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(index, payload, Map.of("refresh", "true", "op_type", "index"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(1));
+        assertCount(index, 1);
+        assertEquals(2, ((Number) client().prepareGet(index, "x").get().getSourceAsMap().get("ints")).intValue());
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------------------------
     // Client disconnections
 
     private long openHttpConnections() {
@@ -873,9 +997,9 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
         try (var socket = new Socket(address.getAddress(), address.getPort())) {
             socket.setSoLinger(true, 0); // closing sends a reset
             OutputStream out = socket.getOutputStream();
-            String headers = "POST /_arrow/"
-                + index
-                + "/_bulk?refresh=true HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+            String headers = "POST /_arrow/" + index
+            // Every record batch is sent as soon as it is read
+                + "/_bulk?refresh=true&bulk_rows=1 HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
                 + Arrow.MEDIA_TYPE
                 + "\r\nTransfer-Encoding: chunked\r\n\r\n"
                 + Integer.toHexString(firstChunk.length)

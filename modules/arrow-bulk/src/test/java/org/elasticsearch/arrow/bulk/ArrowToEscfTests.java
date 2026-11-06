@@ -341,6 +341,95 @@ public class ArrowToEscfTests extends ESTestCase {
         }
     }
 
+    /**
+     * The rows of several record batches (here, different roots with the same schema, as the stream reader reuses one) are appended to
+     * a single batch: columns that appear in a later record batch (here, the keys of a map) are absent in the previous rows.
+     */
+    public void testAppendRecordBatches() throws IOException {
+        var entries = new Field(
+            "entries",
+            FieldType.notNullable(ArrowType.Struct.INSTANCE),
+            List.of(new Field("key", FieldType.notNullable(new ArrowType.Utf8()), null), field("value", new ArrowType.Int(32, true)))
+        );
+        var schema = new Schema(
+            List.of(
+                field("n", new ArrowType.Int(64, true)),
+                field("s", new ArrowType.Utf8()),
+                new Field("m", FieldType.nullable(new ArrowType.Map(false)), List.of(entries))
+            )
+        );
+
+        try (var first = VectorSchemaRoot.create(schema, allocator); var second = VectorSchemaRoot.create(schema, allocator)) {
+            // First record batch: two rows, the map of the second row is empty
+            ((BigIntVector) first.getVector("n")).setSafe(0, 1);
+            ((BigIntVector) first.getVector("n")).setSafe(1, 2);
+            ((VarCharVector) first.getVector("s")).setSafe(0, new Text("a"));
+            ((VarCharVector) first.getVector("s")).setSafe(1, new Text("b"));
+            writeMap(first, 0, Map.of("k", 1));
+            writeMap(first, 1, Map.of());
+            first.setRowCount(2);
+
+            // Second record batch: three rows, with a null, and a map with a key that wasn't there before
+            ((BigIntVector) second.getVector("n")).setSafe(0, 3);
+            second.getVector("n").setNull(1);
+            ((BigIntVector) second.getVector("n")).setSafe(2, 5);
+            for (int i = 0; i < 3; i++) {
+                ((VarCharVector) second.getVector("s")).setSafe(i, new Text(List.of("c", "d", "e").get(i)));
+            }
+            writeMap(second, 0, Map.of("z", 9));
+            writeMap(second, 1, Map.of("k", 2));
+            writeMap(second, 2, Map.of());
+            second.setRowCount(3);
+
+            var conversion = converter.newConversion();
+            try {
+                conversion.append(first, Map.of(), allColumns(first), null);
+                assertThat(conversion.rowCount(), equalTo(2));
+                // A record batch without rows changes nothing
+                first.setRowCount(0);
+                conversion.append(first, Map.of(), allColumns(first), null);
+                conversion.append(second, Map.of(), allColumns(second), null);
+                assertThat(conversion.rowCount(), equalTo(5));
+
+                try (EscfBatch batch = conversion.build()) {
+                    assertThat(batch.docCount(), equalTo(5));
+                    assertThat(row(batch, 0), equalTo(Map.of("n", 1, "s", "a", "m", Map.of("k", 1))));
+                    assertThat(row(batch, 1), equalTo(Map.of("n", 2, "s", "b")));
+                    assertThat(row(batch, 2), equalTo(Map.of("n", 3, "s", "c", "m", Map.of("z", 9))));
+                    assertThat(row(batch, 3), equalTo(Map.of("s", "d", "m", Map.of("k", 2))));
+                    assertThat(row(batch, 4), equalTo(Map.of("n", 5, "s", "e")));
+                }
+            } catch (RuntimeException | AssertionError e) {
+                conversion.close();
+                throw e;
+            }
+        }
+    }
+
+    public void testBuildWithoutRowsIsRejected() {
+        var conversion = converter.newConversion();
+        try {
+            expectThrows(IllegalStateException.class, conversion::build);
+        } finally {
+            conversion.close();
+        }
+    }
+
+    private static void writeMap(VectorSchemaRoot root, int position, Map<String, Integer> values) {
+        var map = (MapVector) root.getVector("m");
+        var writer = map.getWriter();
+        writer.setPosition(position);
+        writer.startMap();
+        for (var entry : values.entrySet()) {
+            writer.startEntry();
+            writer.key().varChar().writeVarChar(new Text(entry.getKey()));
+            writer.value().integer().writeInt(entry.getValue());
+            writer.endEntry();
+        }
+        writer.endMap();
+        map.setValueCount(position + 1);
+    }
+
     public void testUnsupportedTypeIsRejected() {
         var schema = new Schema(List.of(field("dec", new ArrowType.Decimal(10, 2, 128))));
         try (var root = VectorSchemaRoot.create(schema, allocator)) {

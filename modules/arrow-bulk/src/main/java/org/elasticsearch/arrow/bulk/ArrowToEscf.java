@@ -43,6 +43,7 @@ import org.apache.arrow.vector.util.ReusableByteArray;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.recycler.Recycler;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.escf.EscfBatch;
 import org.elasticsearch.escf.EscfColumnBuilder;
@@ -107,29 +108,22 @@ final class ArrowToEscf {
      * @return a batch that must be closed by the caller
      */
     EscfBatch convert(VectorSchemaRoot root, Map<Long, Dictionary> dictionaries, BitSet valueColumns, @Nullable int[] rows) {
-        int rowCount = rows == null ? root.getRowCount() : rows.length;
-        if (rowCount == 0) {
-            throw new IllegalStateException("cannot build a batch without rows");
-        }
-        int[] positions = rows;
-        if (positions == null) {
-            positions = new int[rowCount];
-            for (int i = 0; i < rowCount; i++) {
-                positions[i] = i;
-            }
-        }
-
-        Conversion conversion = new Conversion(rowCount, dictionaries);
+        Conversion conversion = new Conversion();
         try {
-            for (int i = valueColumns.nextSetBit(0); i >= 0; i = valueColumns.nextSetBit(i + 1)) {
-                ValueVector vector = root.getVector(i);
-                conversion.writeColumn(ROOT, vector.getName(), vector, positions);
-            }
+            conversion.append(root, dictionaries, valueColumns, rows);
             return conversion.build();
         } catch (RuntimeException e) {
             conversion.close();
             throw e;
         }
+    }
+
+    /**
+     * Starts a conversion to which the rows of several record batches can be appended, to build a single batch that is bigger than
+     * a record batch. The caller must either {@link Conversion#build() build} the batch or {@link Conversion#close() close} it.
+     */
+    Conversion newConversion() {
+        return new Conversion();
     }
 
     /**
@@ -169,20 +163,60 @@ final class ArrowToEscf {
     }
 
     /** The state of the conversion of one batch: the schema being discovered, and one column builder per leaf. */
-    private final class Conversion {
-        private final int rowCount;
-        private final Map<Long, Dictionary> dictionaries;
+    final class Conversion implements Releasable {
+        /** The number of rows appended so far. */
+        private int rowCount;
+        /** The row of the batch to which the first row of the record batch that is being appended goes. */
+        private int base;
+        /** The dictionaries of the record batch that is being appended: they can change from one record batch to the next. */
+        private Map<Long, Dictionary> dictionaries;
         private final SourceSchema schema = new SourceSchema();
         private final List<EscfColumnBuilder> builders = new ArrayList<>();
         private final ReusableByteArray bytesBuffer = new ReusableByteArray();
         private final BytesRef bytesRef = new BytesRef();
 
-        Conversion(int rowCount, Map<Long, Dictionary> dictionaries) {
-            this.rowCount = rowCount;
-            this.dictionaries = dictionaries;
+        private Conversion() {}
+
+        /** The number of rows appended so far. */
+        int rowCount() {
+            return rowCount;
         }
 
+        /**
+         * Appends rows of a record batch. The columns of the batch are the ones of the previous calls: the column builders and the
+         * schema are shared, and the rows are written after the ones that were appended before.
+         *
+         * @param root the Arrow data. Its vectors are only read during this call, so they can be reused afterwards
+         * @param dictionaries to look up the values of dictionary-encoded vectors
+         * @param valueColumns the indices of the vectors that are document fields (as opposed to bulk metadata like {@code _id})
+         * @param rows the rows to append, in order, or {@code null} to append all the rows of {@code root}
+         */
+        void append(VectorSchemaRoot root, Map<Long, Dictionary> dictionaries, BitSet valueColumns, @Nullable int[] rows) {
+            int count = rows == null ? root.getRowCount() : rows.length;
+            if (count == 0) {
+                return;
+            }
+            int[] positions = rows;
+            if (positions == null) {
+                positions = new int[count];
+                for (int i = 0; i < count; i++) {
+                    positions[i] = i;
+                }
+            }
+            this.dictionaries = dictionaries;
+            this.base = rowCount;
+            for (int i = valueColumns.nextSetBit(0); i >= 0; i = valueColumns.nextSetBit(i + 1)) {
+                ValueVector vector = root.getVector(i);
+                writeColumn(ROOT, vector.getName(), vector, positions);
+            }
+            rowCount += count;
+        }
+
+        /** Builds the batch of all the rows that were appended. The conversion can't be used afterwards. */
         EscfBatch build() {
+            if (rowCount == 0) {
+                throw new IllegalStateException("cannot build a batch without rows");
+            }
             int leafCount = schema.leafCount();
             EscfColumnData[] columns = new EscfColumnData[leafCount];
             try {
@@ -197,7 +231,8 @@ final class ArrowToEscf {
             return EscfBatch.of(schema, rowCount, columns, Releasables.wrap(columns));
         }
 
-        void close() {
+        @Override
+        public void close() {
             Releasables.close(builders);
         }
 
@@ -263,13 +298,13 @@ final class ArrowToEscf {
 
         private void setValue(EscfColumnBuilder builder, int row, Accessor accessor, int pos) {
             switch (accessor.kind) {
-                case LONG -> builder.setLong(row, accessor.longs.applyAsLong(pos));
-                case DOUBLE -> builder.setDouble(row, accessor.doubles.applyAsDouble(pos));
-                case BOOLEAN -> builder.setBoolean(row, accessor.booleans.test(pos));
+                case LONG -> builder.setLong(base + row, accessor.longs.applyAsLong(pos));
+                case DOUBLE -> builder.setDouble(base + row, accessor.doubles.applyAsDouble(pos));
+                case BOOLEAN -> builder.setBoolean(base + row, accessor.booleans.test(pos));
                 case STRING -> {
                     // Builders copy the bytes, so the read buffer can be reused.
                     accessor.strings.read(pos, bytesBuffer);
-                    builder.setString(row, bytesBuffer.getBuffer(), 0, (int) bytesBuffer.getLength());
+                    builder.setString(base + row, bytesBuffer.getBuffer(), 0, (int) bytesBuffer.getLength());
                 }
             }
         }
@@ -364,7 +399,7 @@ final class ArrowToEscf {
                     continue;
                 }
 
-                builder.beginArray(row);
+                builder.beginArray(base + row);
                 for (int i = start; i < end; i++) {
                     if (elements.isNull(i)) {
                         continue;
@@ -395,7 +430,7 @@ final class ArrowToEscf {
                 }
             }
             // This is an "append" operation, so rows without a value must be filled first
-            builder.addAbsents(row - builder.nextAppendRow());
+            builder.addAbsents(base + row - builder.nextAppendRow());
             byte[] packed = SourceBatchEncodeHelper.packUnionArray(types, new long[count], new Object[count], count);
             builder.addArray(SourceValueType.UNION_ARRAY, packed);
         }

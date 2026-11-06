@@ -35,6 +35,7 @@ import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.bytes.CompositeBytesReference;
 import org.elasticsearch.common.bytes.ReleasableBytesReference;
 import org.elasticsearch.common.recycler.Recycler;
+import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.rest.BaseRestHandler;
@@ -133,6 +134,22 @@ public class ArrowBulkAction extends BaseRestHandler {
         var opType = DocWriteRequest.OpType.fromString(request.param("op_type", DocWriteRequest.OpType.CREATE.getLowercase()));
         String waitForActiveShards = request.param("wait_for_active_shards");
 
+        // The rows of record batches are sent in bulk requests of about this size
+        int bulkRows = request.paramAsInt("bulk_rows", ArrowBulkParser.DEFAULT_BULK_ROWS);
+        if (bulkRows < 1) {
+            throw new IllegalArgumentException("[bulk_rows] must be greater than zero, but was [" + bulkRows + "]");
+        }
+        ByteSizeValue bulkBytes = request.paramAsSize("bulk_bytes", ByteSizeValue.ofBytes(ArrowBulkParser.DEFAULT_BULK_BYTES));
+        if (bulkBytes.getBytes() < 1 || bulkBytes.getBytes() > ArrowBulkParser.MAX_BULK_BYTES) {
+            throw new IllegalArgumentException(
+                "[bulk_bytes] must be between [1b] and ["
+                    + ByteSizeValue.ofBytes(ArrowBulkParser.MAX_BULK_BYTES)
+                    + "], but was ["
+                    + bulkBytes
+                    + "]"
+            );
+        }
+
         var params = new ArrowBulkParser.Params(
             request.param("index"),
             request.param("routing"),
@@ -141,6 +158,8 @@ public class ArrowBulkAction extends BaseRestHandler {
             request.paramAsBoolean(DocWriteRequest.REQUIRE_DATA_STREAM, false),
             request.paramAsTime("timeout", BulkShardRequest.DEFAULT_TIMEOUT),
             waitForActiveShards == null ? null : ActiveShardCount.parseString(waitForActiveShards),
+            bulkRows,
+            bulkBytes.getBytes(),
             request.params().keySet()
         );
 
