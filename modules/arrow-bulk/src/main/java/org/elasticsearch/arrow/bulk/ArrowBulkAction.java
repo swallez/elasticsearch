@@ -29,6 +29,7 @@ import org.elasticsearch.action.support.ActiveShardCount;
 import org.elasticsearch.action.support.WriteRequest;
 import org.elasticsearch.arrow.Arrow;
 import org.elasticsearch.client.internal.node.NodeClient;
+import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
@@ -141,19 +142,27 @@ public class ArrowBulkAction extends BaseRestHandler {
         String waitForActiveShards = request.param("wait_for_active_shards");
 
         // The rows of record batches are sent in bulk requests of about this size
-        int bulkRows = request.paramAsInt("bulk_rows", ArrowBulkParser.DEFAULT_BULK_ROWS);
-        if (bulkRows < 1) {
-            throw new IllegalArgumentException("[bulk_rows] must be greater than zero, but was [" + bulkRows + "]");
+        // When they aren't set, the sizes depend on the shards of the targets, see ArrowBulkParser
+        Integer bulkRows = null;
+        if (request.hasParam("bulk_rows")) {
+            bulkRows = request.paramAsInt("bulk_rows", ArrowBulkParser.DEFAULT_BULK_ROWS);
+            if (bulkRows < 1) {
+                throw new IllegalArgumentException("[bulk_rows] must be greater than zero, but was [" + bulkRows + "]");
+            }
         }
-        ByteSizeValue bulkBytes = request.paramAsSize("bulk_bytes", ByteSizeValue.ofBytes(ArrowBulkParser.DEFAULT_BULK_BYTES));
-        if (bulkBytes.getBytes() < 1 || bulkBytes.getBytes() > ArrowBulkParser.MAX_BULK_BYTES) {
-            throw new IllegalArgumentException(
-                "[bulk_bytes] must be between [1b] and ["
-                    + ByteSizeValue.ofBytes(ArrowBulkParser.MAX_BULK_BYTES)
-                    + "], but was ["
-                    + bulkBytes
-                    + "]"
-            );
+        Long bulkBytes = null;
+        if (request.hasParam("bulk_bytes")) {
+            ByteSizeValue size = request.paramAsSize("bulk_bytes", ByteSizeValue.ofBytes(ArrowBulkParser.DEFAULT_BULK_BYTES));
+            if (size.getBytes() < 1 || size.getBytes() > ArrowBulkParser.MAX_BULK_BYTES) {
+                throw new IllegalArgumentException(
+                    "[bulk_bytes] must be between [1b] and ["
+                        + ByteSizeValue.ofBytes(ArrowBulkParser.MAX_BULK_BYTES)
+                        + "], but was ["
+                        + size
+                        + "]"
+                );
+            }
+            bulkBytes = size.getBytes();
         }
 
         var params = new ArrowBulkParser.Params(
@@ -165,7 +174,7 @@ public class ArrowBulkAction extends BaseRestHandler {
             request.paramAsTime("timeout", BulkShardRequest.DEFAULT_TIMEOUT),
             waitForActiveShards == null ? null : ActiveShardCount.parseString(waitForActiveShards),
             bulkRows,
-            bulkBytes.getBytes(),
+            bulkBytes,
             request.params().keySet()
         );
 
@@ -230,6 +239,7 @@ public class ArrowBulkAction extends BaseRestHandler {
                 params,
                 recycler,
                 () -> ShardBatchIndexer.isBatchIndexingSupported(batchIndexingEnabled, clusterService),
+                target -> TargetShards.maxCopiesPerNode(clusterService.state().projectState(ProjectId.DEFAULT), target),
                 pipeline::add
             );
         }

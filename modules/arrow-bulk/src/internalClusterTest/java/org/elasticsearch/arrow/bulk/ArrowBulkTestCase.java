@@ -930,6 +930,38 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
         assertCount(index, 2_000);
     }
 
+    /**
+     * By default, the number of rows of a bulk request depends on the shards of the target: a bulk request waits for the translog of
+     * each shard that it writes to, so the more shards the target has on a node, the more rows it needs to share this cost. A routing
+     * sends all the documents to one shard, whatever the shards of the target.
+     */
+    public void testDefaultBulkSizeFollowsTheShardsOfTheTarget() throws Exception {
+        int rows = ArrowBulkParser.DEFAULT_BULK_ROWS;
+        byte[] payload = rowsStream(2, rows);
+
+        // One shard: each record batch has enough rows to be sent
+        String single = "arrow_size_one_shard";
+        createBatchIndex(single);
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(single, payload)), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(2));
+
+        // Two shards on the only node: twice the rows are needed, so both record batches are sent together
+        String shards = "arrow_size_two_shards";
+        createBatchIndex(shards, Settings.builder().put("index.number_of_shards", 2), "ints", "type=integer", "strings", "type=keyword");
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(shards, payload)), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(1));
+        assertCount(shards, 2L * rows);
+
+        // With a routing, the second shard doesn't matter
+        String routed = "arrow_size_routed";
+        createBatchIndex(routed, Settings.builder().put("index.number_of_shards", 2), "ints", "type=integer", "strings", "type=keyword");
+        HoldBulksPlugin.bulkRequests.set(0);
+        assertThat(failures(post(routed, payload, Map.of("refresh", "true", "routing", "some-routing"))), empty());
+        assertThat(HoldBulksPlugin.bulkRequests.get(), equalTo(2));
+    }
+
     /** The rows of each target are accumulated across record batches: one bulk request per index for the stream. */
     public void testIndexColumnAcrossRecordBatches() throws Exception {
         createBatchIndex("arrow_coalesce_a");

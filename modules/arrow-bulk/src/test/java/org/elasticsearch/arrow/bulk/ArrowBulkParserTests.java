@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
+import java.util.function.ToIntFunction;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
@@ -61,10 +62,15 @@ public class ArrowBulkParserTests extends ESTestCase {
         }
     }
 
-    private static ArrowBulkParser.Params params(@Nullable String defaultIndex, int bulkRows, long bulkBytes) {
+    private static ArrowBulkParser.Params params(
+        @Nullable String defaultIndex,
+        @Nullable String routing,
+        @Nullable Integer bulkRows,
+        @Nullable Long bulkBytes
+    ) {
         return new ArrowBulkParser.Params(
             defaultIndex,
-            null,
+            routing,
             DocWriteRequest.OpType.CREATE,
             false,
             false,
@@ -76,13 +82,21 @@ public class ArrowBulkParserTests extends ESTestCase {
         );
     }
 
+    private static ArrowBulkParser.Params params(@Nullable String defaultIndex, int bulkRows, long bulkBytes) {
+        return params(defaultIndex, null, bulkRows, bulkBytes);
+    }
+
     private ArrowBulkParser parser(int bulkRows, long bulkBytes) {
         return parser(params(DEFAULT_INDEX, bulkRows, bulkBytes), () -> true);
     }
 
     private ArrowBulkParser parser(ArrowBulkParser.Params params, BooleanSupplier supported) {
+        return parser(params, supported, index -> 1);
+    }
+
+    private ArrowBulkParser parser(ArrowBulkParser.Params params, BooleanSupplier supported, ToIntFunction<String> shardCopies) {
         var recycler = new BytesRefRecycler(new MockPageCacheRecycler(Settings.EMPTY));
-        return new ArrowBulkParser(params, recycler, supported, bulks::add);
+        return new ArrowBulkParser(params, recycler, supported, shardCopies, bulks::add);
     }
 
     private static Field field(String name, ArrowType type) {
@@ -265,6 +279,81 @@ public class ArrowBulkParserTests extends ESTestCase {
             assertThat("the rows of the first record batch were not sent", bulks.size(), equalTo(0));
         }
         // ESTestCase checks that all the pages were released
+    }
+
+    private List<Integer> bulkSizes(String index) {
+        return bulks.stream().filter(b -> b.index().equals(index)).map(b -> b.request().requests().size()).toList();
+    }
+
+    /** By default, a target gets 10000 rows per copy of its shards that a node holds: the cost of each shard is shared by enough rows. */
+    public void testDefaultSizeFollowsTheShardCopiesOfTheTarget() throws IOException {
+        int rows = ArrowBulkParser.DEFAULT_BULK_ROWS;
+        byte[] stream = stream(rows, rows, rows);
+
+        // One copy: every record batch has enough rows to be sent
+        try (var parser = parser(params(DEFAULT_INDEX, null, null, null), () -> true, index -> 1)) {
+            parser.parse(new BytesArray(stream), true);
+        }
+        assertThat(bulkSizes(DEFAULT_INDEX), equalTo(List.of(rows, rows, rows)));
+        releaseBulks();
+        bulks.clear();
+
+        // Three copies: 30000 rows are needed
+        try (var parser = parser(params(DEFAULT_INDEX, null, null, null), () -> true, index -> 3)) {
+            parser.parse(new BytesArray(stream), true);
+        }
+        assertThat(bulkSizes(DEFAULT_INDEX), equalTo(List.of(3 * rows)));
+    }
+
+    /** With a routing, all the documents go to the same shard: the other shards don't count. */
+    public void testRoutingIgnoresTheShards() throws IOException {
+        int rows = ArrowBulkParser.DEFAULT_BULK_ROWS;
+        try (var parser = parser(params(DEFAULT_INDEX, "some-routing", null, null), () -> true, index -> 3)) {
+            parser.parse(new BytesArray(stream(rows, rows, rows)), true);
+        }
+        assertThat(bulkSizes(DEFAULT_INDEX), equalTo(List.of(rows, rows, rows)));
+    }
+
+    /** A size that was requested is used as it is: it is the one of the bulk requests. */
+    public void testRequestedSizeIsNotScaled() throws IOException {
+        int rows = ArrowBulkParser.DEFAULT_BULK_ROWS;
+        try (var parser = parser(params(DEFAULT_INDEX, null, rows, null), () -> true, index -> 3)) {
+            parser.parse(new BytesArray(stream(rows, rows, rows)), true);
+        }
+        assertThat(bulkSizes(DEFAULT_INDEX), equalTo(List.of(rows, rows, rows)));
+    }
+
+    public void testEachTargetHasItsOwnSize() throws IOException {
+        int rows = ArrowBulkParser.DEFAULT_BULK_ROWS;
+        // Rows alternate between the indices: each of them has 5000 rows of each record batch, so 15000 rows in three record batches
+        byte[] stream = stream(new int[] { rows, rows, rows }, List.of(ArrowBulkParser.INDEX), (vector, row) -> {
+            vector.setSafe(row % rows, new Text(row % 2 == 0 ? "small" : "big"));
+        });
+        // "big" has three copies of shards on a node: its 15000 rows wait for the end of the stream, those of "small" are sent
+        // as soon as there are 10000
+        try (var parser = parser(params(null, null, null, null), () -> true, index -> index.equals("big") ? 3 : 1)) {
+            parser.parse(new BytesArray(stream), true);
+        }
+        assertThat(bulkSizes("small"), equalTo(List.of(10_000, 5_000)));
+        assertThat(bulkSizes("big"), equalTo(List.of(15_000)));
+    }
+
+    public void testSizesOfBulkRequests() {
+        // The requested sizes are used as they are
+        assertThat(ArrowBulkParser.bulkRowsFor(5, 4), equalTo(5));
+        assertThat(ArrowBulkParser.bulkBytesFor(100L, 4), equalTo(100L));
+
+        // Otherwise the default is for each copy of a shard on a node
+        assertThat(ArrowBulkParser.bulkRowsFor(null, 1), equalTo(ArrowBulkParser.DEFAULT_BULK_ROWS));
+        assertThat(ArrowBulkParser.bulkRowsFor(null, 4), equalTo(4 * ArrowBulkParser.DEFAULT_BULK_ROWS));
+        assertThat(ArrowBulkParser.bulkBytesFor(null, 1), equalTo(ArrowBulkParser.DEFAULT_BULK_BYTES));
+        assertThat(ArrowBulkParser.bulkBytesFor(null, 3), equalTo(3 * ArrowBulkParser.DEFAULT_BULK_BYTES));
+
+        // Whatever the number of shards, sizes are bounded
+        assertThat(ArrowBulkParser.bulkRowsFor(null, Integer.MAX_VALUE), equalTo(Integer.MAX_VALUE));
+        assertThat(ArrowBulkParser.bulkBytesFor(null, 1_000), equalTo(ArrowBulkParser.MAX_BULK_BYTES));
+        // And there is always at least one copy
+        assertThat(ArrowBulkParser.bulkRowsFor(null, 0), equalTo(ArrowBulkParser.DEFAULT_BULK_ROWS));
     }
 
     public void testBatchIndexingMustBeSupported() throws IOException {

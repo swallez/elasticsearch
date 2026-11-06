@@ -41,6 +41,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.ToIntFunction;
 
 /**
  * Parses an Arrow IPC stream and turns every record batch into bulk requests carrying a pre-built {@link EscfBatch}, so that
@@ -48,8 +49,8 @@ import java.util.function.Consumer;
  * <p>
  * Bulk requests can carry only one pre-built batch, so there is one bulk request per target index (see {@link #INDEX}). Every bulk
  * request has a fixed cost (it waits for the translog to be synced, on every shard that it writes to), so small record batches are
- * not sent one by one: their rows are accumulated, per target, and sent when there are {@link Params#bulkRows()} rows, when the data
- * that was accumulated for all the targets reaches {@link Params#bulkBytes()}, or when the stream ends. A record batch is never split, so a
+ * not sent one by one: their rows are accumulated, per target, and sent when there are enough of them (see {@link Params#bulkRows()}),
+ * when what was accumulated is too big (see {@link Params#bulkBytes()}), or when the stream ends. A record batch is never split, so a
  * record batch that is bigger than this is sent as is. Memory usage is bounded by the target size, and not by the size of the stream.
  * <p>
  * The columns of the Arrow table are the fields of the documents, except for the following ones that carry bulk metadata
@@ -67,7 +68,8 @@ final class ArrowBulkParser implements Releasable {
     static final String ACTION = "_bulk_action";
 
     /**
-     * The default number of rows after which the rows accumulated for a target are sent ({@code bulk_rows}). With the default
+     * The default number of rows after which the rows accumulated for a target are sent ({@code bulk_rows}), for each copy of a shard
+     * of the target that a node holds. With the default
      * translog durability, a bulk request waits for the translog to be synced, so the throughput of small bulk requests is limited by
      * that: in a benchmark of 12 columns, record batches of 1000 rows were indexed at about 73k rows/s, 10k rows at 259k, and 50k rows
      * at 322k. Above 10k rows, the cost of the rows dominates.
@@ -75,8 +77,9 @@ final class ArrowBulkParser implements Releasable {
     static final int DEFAULT_BULK_ROWS = 10_000;
 
     /**
-     * The default (approximate, it's the size of the Arrow buffers) number of bytes after which everything that was accumulated is
-     * sent ({@code bulk_bytes}), to bound the memory used by the rows that wait to be sent, also when they go to many different targets.
+     * The default (approximate, it's the size of the Arrow buffers) number of bytes after which the rows of a target are sent
+     * ({@code bulk_bytes}), for each copy of a shard of the target that a node holds. It also bounds the memory used by the rows
+     * that wait to be sent, also when they go to many different targets.
      */
     static final long DEFAULT_BULK_BYTES = 8L * 1024 * 1024;
 
@@ -93,8 +96,10 @@ final class ArrowBulkParser implements Releasable {
      * @param requireDataStream whether the target must be a data stream
      * @param timeout the timeout of bulk requests
      * @param waitForActiveShards the number of active shard copies required to proceed, or {@code null} for the default
-     * @param bulkRows the number of rows of a target after which they are sent as a bulk request
-     * @param bulkBytes the size (of the Arrow buffers) of everything that waits, after which it is all sent
+     * @param bulkRows the number of rows of a target after which they are sent as a bulk request, or {@code null} to use
+     *                 {@link #DEFAULT_BULK_ROWS} for each copy of a shard of the target that a node holds, see {@link TargetShards}
+     * @param bulkBytes the size (of the Arrow buffers) of a target after which its rows are sent, and of everything that waits after
+     *                  which all is sent, or {@code null} to use {@link #DEFAULT_BULK_BYTES} in the same way, up to {@link #MAX_BULK_BYTES}
      * @param paramsUsed the REST request parameters, for telemetry
      */
     record Params(
@@ -105,8 +110,8 @@ final class ArrowBulkParser implements Releasable {
         boolean requireDataStream,
         TimeValue timeout,
         @Nullable ActiveShardCount waitForActiveShards,
-        int bulkRows,
-        long bulkBytes,
+        @Nullable Integer bulkRows,
+        @Nullable Long bulkBytes,
         Set<String> paramsUsed
     ) {}
 
@@ -140,16 +145,21 @@ final class ArrowBulkParser implements Releasable {
     /** The rows that wait to be sent, by target index. */
     private final Map<String, Accumulator> accumulators = new LinkedHashMap<>();
 
+    private final ToIntFunction<String> maxShardCopiesPerNode;
+
     /**
      * @param batchIndexingSupported whether columnar indexing can be used by the cluster
+     * @param maxShardCopiesPerNode for a target, the highest number of copies of its shards that a node holds, see {@link TargetShards}
      * @param bulkConsumer receives the bulk requests, in stream order. It becomes responsible for closing them.
      */
     ArrowBulkParser(
         Params params,
         Recycler<BytesRef> recycler,
         BooleanSupplier batchIndexingSupported,
+        ToIntFunction<String> maxShardCopiesPerNode,
         Consumer<PendingBulk> bulkConsumer
     ) {
+        this.maxShardCopiesPerNode = maxShardCopiesPerNode;
         this.params = params;
         this.batchIndexingSupported = batchIndexingSupported;
         this.bulkConsumer = bulkConsumer;
@@ -255,16 +265,38 @@ final class ArrowBulkParser implements Releasable {
             accumulator.append(dictionaries, rows, count, firstRow, recordBatchBytes * count / rowCount);
         }
 
-        // Everything is sent when too much waits, otherwise only the targets that have enough rows
+        // Everything is sent when too much waits, otherwise only the targets that have enough rows, or that are too big
         long accumulatedBytes = 0;
+        long maxBytes = 0;
         for (Accumulator accumulator : accumulators.values()) {
             accumulatedBytes += accumulator.bytes;
+            maxBytes = Math.max(maxBytes, accumulator.bytesLimit);
         }
+        boolean sendAll = accumulatedBytes >= maxBytes;
         for (Accumulator accumulator : new ArrayList<>(accumulators.values())) {
-            if (accumulatedBytes >= params.bulkBytes() || accumulator.rows() >= params.bulkRows()) {
+            if (sendAll || accumulator.rows() >= accumulator.rowsLimit || accumulator.bytes >= accumulator.bytesLimit) {
                 flush(accumulator);
             }
         }
+    }
+
+    /**
+     * The number of rows after which the rows of a target are sent: the one that was requested, or by default
+     * {@link #DEFAULT_BULK_ROWS} for each of the {@code copies} of shards of the target that are on a node.
+     */
+    static int bulkRowsFor(@Nullable Integer requested, int copies) {
+        if (requested != null) {
+            return requested;
+        }
+        return (int) Math.min(Integer.MAX_VALUE, (long) DEFAULT_BULK_ROWS * Math.max(1, copies));
+    }
+
+    /** The same as {@link #bulkRowsFor}, for the size, which is also limited by {@link #MAX_BULK_BYTES} by default. */
+    static long bulkBytesFor(@Nullable Long requested, int copies) {
+        if (requested != null) {
+            return requested;
+        }
+        return Math.min(MAX_BULK_BYTES, DEFAULT_BULK_BYTES * Math.max(1, copies));
     }
 
     /** Sends the rows that were accumulated for a target, as a bulk request with a single pre-built batch. */
@@ -307,10 +339,18 @@ final class ArrowBulkParser implements Releasable {
         final List<String> ids;
         /** The approximate size of what was accumulated, in bytes. */
         long bytes;
+        /** The number of rows after which they are sent. */
+        final int rowsLimit;
+        /** The number of bytes after which they are sent. */
+        final long bytesLimit;
 
         Accumulator(String index) {
             this.index = index;
             this.ids = idColumn < 0 ? null : new ArrayList<>();
+            // With a routing, all the documents go to a single shard, whatever the shards of the target
+            int copies = params.routing() != null ? 1 : maxShardCopiesPerNode.applyAsInt(index);
+            this.rowsLimit = bulkRowsFor(params.bulkRows(), copies);
+            this.bytesLimit = bulkBytesFor(params.bulkBytes(), copies);
         }
 
         int rows() {
