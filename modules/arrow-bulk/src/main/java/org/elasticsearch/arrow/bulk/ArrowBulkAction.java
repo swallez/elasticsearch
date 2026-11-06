@@ -50,6 +50,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -60,9 +61,11 @@ import static org.elasticsearch.rest.RestRequest.Method.PUT;
 /**
  * Bulk ingestion of Arrow IPC streams.
  * <p>
- * Every Arrow record batch is converted to a columnar batch and indexed as a bulk request. Requests are executed one at a time
- * so that a streamed request only asks for the next HTTP chunk once the previous record batch was indexed: this applies
- * back-pressure to the client and bounds memory usage.
+ * The rows of the Arrow record batches are converted to columnar batches and indexed as bulk requests (see
+ * {@link ArrowBulkParser}). Up to {@link #MAX_IN_FLIGHT_BULKS} bulk requests of a stream run at the same time if the stream has no
+ * document ids: the documents are then independent, and parsing the next data overlaps with indexing. With ids, bulk requests run one
+ * at a time, in the order of the stream, as documents can overwrite each other. The next chunk of a streamed request is only
+ * requested when no bulk request waits to be sent, which applies back-pressure to the client and bounds memory usage.
  * <p>
  * The response is an Arrow stream that describes the failed items. It is an empty table if all items were indexed. Failures that
  * affect the whole request (for example a malformed stream) are returned as regular JSON errors, and items that come after
@@ -74,6 +77,9 @@ public class ArrowBulkAction extends BaseRestHandler {
 
     public static final String ID = ArrowBulkParser.ID;
     public static final String INDEX = ArrowBulkParser.INDEX;
+
+    /** The number of bulk requests of a stream that can run at the same time, when the order in which they run doesn't matter. */
+    static final int MAX_IN_FLIGHT_BULKS = 4;
 
     public static final String ERR_ITEM_NO = "item_no";
     public static final String ERR_STATUS = "status";
@@ -174,12 +180,17 @@ public class ArrowBulkAction extends BaseRestHandler {
 
     /**
      * Consumes the body of the request, as a stream or as a single chunk, and runs the resulting bulk requests.
+     * <p>
+     * Chunks are received by the thread of the HTTP channel, and the bulk requests complete on other threads. All the state is
+     * guarded by {@link #lock}, which is never held while calling something that can call back: sending a bulk request, requesting
+     * a chunk, or sending the response.
      */
     private class ChunkHandler implements BaseRestHandler.RequestBodyChunkConsumer {
 
         private final RestRequest request;
         private final NodeClient client;
         private final ArrowBulkParser parser;
+        private final Object lock = new Object();
 
         /**
          * Received HTTP chunks that aren't fully parsed yet. An Arrow message can span several chunks, so bytes are kept until a
@@ -188,10 +199,11 @@ public class ArrowBulkAction extends BaseRestHandler {
         private final ArrayDeque<ReleasableBytesReference> unparsedChunks = new ArrayDeque<>();
 
         /**
-         * Bulk requests created from the parsed record batches, that haven't been sent yet. They are executed one at a time, and the next
-         * chunk is requested only once the queue is empty, which applies back-pressure to the client.
+         * Decides when to send the bulk requests that are created from the parsed record batches, and when to request more data. It
+         * holds the bulk requests that were not sent yet. Bulk requests are executed at the same time, but only when the order in
+         * which they are executed doesn't matter, so that parsing the next data overlaps with indexing.
          */
-        private final ArrayDeque<ArrowBulkParser.PendingBulk> pendingBulks = new ArrayDeque<>();
+        private final BulkPipeline<ArrowBulkParser.PendingBulk> pipeline = new BulkPipeline<>(this::maxInFlight);
 
         /** Whether to refresh the written indices once all bulk requests have run, to make the documents visible to searches. */
         private final WriteRequest.RefreshPolicy refreshPolicy;
@@ -206,8 +218,9 @@ public class ArrowBulkAction extends BaseRestHandler {
         private final List<ItemFailure> failures = new ArrayList<>();
 
         private volatile RestChannel channel;
-        private boolean shortCircuited;
-        private boolean lastChunk;
+
+        /** Whether the request is finished, because the response was sent, or because it failed or the client is gone. */
+        private boolean closed;
 
         ChunkHandler(RestRequest request, NodeClient client, ArrowBulkParser.Params params, WriteRequest.RefreshPolicy refreshPolicy) {
             this.request = request;
@@ -217,15 +230,23 @@ public class ArrowBulkAction extends BaseRestHandler {
                 params,
                 recycler,
                 () -> ShardBatchIndexer.isBatchIndexingSupported(batchIndexingEnabled, clusterService),
-                pendingBulks::add
+                pipeline::add
             );
+        }
+
+        /**
+         * The number of bulk requests that can run at the same time. Documents with an id can overwrite each other, or conflict, so
+         * their bulk requests must run one at a time to keep the order of the stream. Without ids, the documents are independent.
+         */
+        private int maxInFlight() {
+            return parser.hasIdColumn() ? 1 : MAX_IN_FLIGHT_BULKS;
         }
 
         @Override
         public void accept(RestChannel channel) {
             this.channel = channel;
             if (request.isStreamedContent()) {
-                request.contentStream().next();
+                step();
             } else {
                 // The whole body is available.
                 ReleasableBytesReference content = request.content();
@@ -237,59 +258,92 @@ public class ArrowBulkAction extends BaseRestHandler {
         @Override
         public void handleChunk(RestChannel channel, ReleasableBytesReference chunk, boolean isLast) {
             assert channel == this.channel;
-            if (shortCircuited) {
-                chunk.close();
-                return;
-            }
-
-            try {
-                if (chunk.length() == 0) {
+            Exception failure = null;
+            synchronized (lock) {
+                if (closed) {
                     chunk.close();
-                } else {
-                    unparsedChunks.add(chunk);
+                    return;
                 }
-                // The last chunk can be empty. The parser must still be told that the stream ended, to detect that it was truncated.
-                if (unparsedChunks.isEmpty() == false || isLast) {
-                    BytesReference data = switch (unparsedChunks.size()) {
-                        case 0 -> BytesArray.EMPTY;
-                        case 1 -> unparsedChunks.getFirst();
-                        default -> CompositeBytesReference.of(unparsedChunks.toArray(new ReleasableBytesReference[0]));
-                    };
-                    // Record batches are converted to bulk requests (added to pendingBulks) as they are parsed
-                    releaseParsed(parser.parse(data, isLast));
+                try {
+                    if (chunk.length() == 0) {
+                        chunk.close();
+                    } else {
+                        unparsedChunks.add(chunk);
+                    }
+                    // The last chunk can be empty. The parser must still be told that the stream ended, to detect that it was truncated.
+                    if (unparsedChunks.isEmpty() == false || isLast) {
+                        BytesReference data = switch (unparsedChunks.size()) {
+                            case 0 -> BytesArray.EMPTY;
+                            case 1 -> unparsedChunks.getFirst();
+                            default -> CompositeBytesReference.of(unparsedChunks.toArray(new ReleasableBytesReference[0]));
+                        };
+                        // Record batches are converted to bulk requests (added to the pipeline) as they are parsed
+                        releaseParsed(parser.parse(data, isLast));
+                    }
+                    pipeline.chunkReceived(isLast);
+                } catch (Exception e) {
+                    failure = e;
                 }
-            } catch (Exception e) {
-                fail(e);
-                return;
             }
-
-            this.lastChunk = isLast;
-            executeNext();
+            if (failure != null) {
+                fail(failure);
+            } else {
+                step();
+            }
         }
 
-        /** Executes pending bulk requests one at a time, then asks for more data or sends the response. */
-        private void executeNext() {
-            ArrowBulkParser.PendingBulk next = pendingBulks.poll();
-            if (next == null) {
-                if (lastChunk) {
-                    refreshThenSendResponse();
-                } else {
-                    request.contentStream().next();
+        /** Does what the pipeline decides: sends the bulk requests that can run, requests more data, or finishes. */
+        private void step() {
+            List<BulkPipeline.Step<ArrowBulkParser.PendingBulk>> steps = new ArrayList<>(MAX_IN_FLIGHT_BULKS + 1);
+            synchronized (lock) {
+                if (closed) {
+                    return;
                 }
-                return;
+                BulkPipeline.Step<ArrowBulkParser.PendingBulk> step;
+                while ((step = pipeline.next()) != null) {
+                    if (step.kind() == BulkPipeline.Kind.SEND) {
+                        writtenIndices.add(step.bulk().index());
+                    }
+                    steps.add(step);
+                }
             }
-
-            writtenIndices.add(next.index());
-            // Hands the batch over to the bulk action, that releases it.
-            client.bulk(next.request(), new ActionListener<>() {
-                @Override
-                public void onResponse(org.elasticsearch.action.bulk.BulkResponse response) {
-                    for (BulkItemResponse item : response.getItems()) {
-                        if (item.isFailed()) {
-                            failures.add(ItemFailure.of(next.rowNumbers()[item.getItemId()], item.getFailure()));
+            for (int i = 0; i < steps.size(); i++) {
+                try {
+                    var step = steps.get(i);
+                    switch (step.kind()) {
+                        case SEND -> send(step.bulk());
+                        case REQUEST_CHUNK -> request.contentStream().next();
+                        case FINISH -> refreshThenSendResponse();
+                    }
+                } catch (Exception e) {
+                    // The bulk requests that weren't sent still own their batches
+                    for (int j = i; j < steps.size(); j++) {
+                        if (steps.get(j).kind() == BulkPipeline.Kind.SEND) {
+                            steps.get(j).bulk().request().releasePreBuiltBatches();
                         }
                     }
-                    executeNext();
+                    fail(e);
+                    return;
+                }
+            }
+        }
+
+        private void send(ArrowBulkParser.PendingBulk bulk) {
+            // Hands the batch over to the bulk action, that releases it.
+            client.bulk(bulk.request(), new ActionListener<>() {
+                @Override
+                public void onResponse(org.elasticsearch.action.bulk.BulkResponse response) {
+                    synchronized (lock) {
+                        pipeline.bulkCompleted();
+                        if (closed == false) {
+                            for (BulkItemResponse item : response.getItems()) {
+                                if (item.isFailed()) {
+                                    failures.add(ItemFailure.of(bulk.rowNumbers()[item.getItemId()], item.getFailure()));
+                                }
+                            }
+                        }
+                    }
+                    step();
                 }
 
                 @Override
@@ -301,25 +355,45 @@ public class ArrowBulkAction extends BaseRestHandler {
 
         /** Refreshes the indices that were written to if the request asked for it, and then sends the response. */
         private void refreshThenSendResponse() {
-            if (refreshPolicy == WriteRequest.RefreshPolicy.NONE || writtenIndices.isEmpty()) {
+            final String[] indices;
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                indices = refreshPolicy == WriteRequest.RefreshPolicy.NONE ? new String[0] : writtenIndices.toArray(String[]::new);
+            }
+            if (indices.length == 0) {
                 sendResponse();
                 return;
             }
-            var refresh = new RefreshRequest(writtenIndices.toArray(String[]::new));
-            client.admin().indices().refresh(refresh, ActionListener.wrap(response -> sendResponse(), this::fail));
+            client.admin().indices().refresh(new RefreshRequest(indices), ActionListener.wrap(response -> sendResponse(), this::fail));
         }
 
         private void sendResponse() {
-            shortCircuit();
+            final List<ItemFailure> sorted;
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                // Bulk requests can complete in any order
+                sorted = new ArrayList<>(failures);
+                sorted.sort(Comparator.comparingLong(ItemFailure::itemNo));
+                shortCircuit();
+            }
             try {
-                channel.sendResponse(new RestResponse(RestStatus.OK, Arrow.MEDIA_TYPE, failuresToArrow(failures)));
+                channel.sendResponse(new RestResponse(RestStatus.OK, Arrow.MEDIA_TYPE, failuresToArrow(sorted)));
             } catch (Exception e) {
                 new RestToXContentListener<>(channel).onFailure(e);
             }
         }
 
         private void fail(Exception e) {
-            shortCircuit();
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                shortCircuit();
+            }
             Exception cause = e instanceof IllegalArgumentException || e instanceof ElasticsearchException
                 ? e
                 : new ElasticsearchParseException("Failed to parse Arrow format", e);
@@ -329,18 +403,21 @@ public class ArrowBulkAction extends BaseRestHandler {
         @Override
         public void streamClose() {
             assert Transports.assertTransportThread();
-            if (shortCircuited == false) {
-                shortCircuit();
+            synchronized (lock) {
+                if (closed == false) {
+                    shortCircuit();
+                }
             }
         }
 
+        /** Closes the request and releases what it holds. The bulk requests that are running own their batches. */
         private void shortCircuit() {
-            shortCircuited = true;
+            assert Thread.holdsLock(lock);
+            closed = true;
             Releasables.closeExpectNoException(parser);
-            for (var pending : pendingBulks) {
+            for (var pending : pipeline.drainPending()) {
                 pending.request().releasePreBuiltBatches();
             }
-            pendingBulks.clear();
             Releasables.close(unparsedChunks);
             unparsedChunks.clear();
         }

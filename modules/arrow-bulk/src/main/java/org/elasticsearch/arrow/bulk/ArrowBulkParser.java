@@ -132,6 +132,11 @@ final class ArrowBulkParser implements Releasable {
     private BitSet valueColumns;
     private long rowsSoFar = 0;
 
+    /** Whether the stream has a column with the ids of the documents. It is known once the schema was read, before any bulk request. */
+    boolean hasIdColumn() {
+        return idColumn >= 0;
+    }
+
     /** The rows that wait to be sent, by target index. */
     private final Map<String, Accumulator> accumulators = new LinkedHashMap<>();
 

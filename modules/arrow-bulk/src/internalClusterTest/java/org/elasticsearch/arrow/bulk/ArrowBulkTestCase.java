@@ -76,6 +76,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.Socket;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -84,6 +85,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
@@ -971,6 +973,86 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
     }
 
     // ---------------------------------------------------------------------------------------------------------------------------------
+    // Bulk requests that run at the same time
+
+    /** Without document ids, the bulk requests of a stream run at the same time, up to a limit, while the data is parsed. */
+    public void testBulkRequestsOverlapWithoutIds() throws Exception {
+        String index = "arrow_overlap";
+        createBatchIndex(index);
+
+        int recordBatches = 2 * ArrowBulkAction.MAX_IN_FLIGHT_BULKS;
+        int rows = 20;
+        byte[] payload = rowsStream(recordBatches, rows);
+        boolean chunked = randomBoolean();
+
+        // Every record batch is sent as a bulk request when it is read, and they are held to see how many run at the same time
+        HoldBulksPlugin.holding = true;
+        var response = CompletableFuture.supplyAsync(() -> {
+            try {
+                return post(index, payload, Map.of("refresh", "true", "bulk_rows", "1"), chunked);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        try {
+            assertBusy(() -> assertThat(HoldBulksPlugin.held.size(), equalTo(ArrowBulkAction.MAX_IN_FLIGHT_BULKS)));
+        } finally {
+            // Let all of them complete. The ones that weren't sent yet aren't held anymore
+            HoldBulksPlugin.holding = false;
+            HoldBulksPlugin.releaseAll();
+        }
+
+        assertThat(failures(response.get(30, java.util.concurrent.TimeUnit.SECONDS)), empty());
+        assertCount(index, (long) recordBatches * rows);
+    }
+
+    /**
+     * With document ids, bulk requests run one at a time, in the order of the stream: documents with the same id can overwrite
+     * each other, and the last one must win.
+     */
+    public void testBulkRequestsWithIdsRunOneAtATime() throws Exception {
+        String index = "arrow_sequential";
+        createBatchIndex(index);
+
+        // The same document in every record batch, with the number of the record batch as value
+        int recordBatches = 2 * ArrowBulkAction.MAX_IN_FLIGHT_BULKS;
+        byte[] payload = arrowStream(
+            new Schema(List.of(stringField(ArrowBulkAction.ID), intField("ints"))),
+            recordBatches,
+            (root, batch) -> {
+                ((VarCharVector) root.getVector(0)).setSafe(0, new Text("x"));
+                ((IntVector) root.getVector(1)).setSafe(0, batch);
+                root.setRowCount(1);
+            }
+        );
+        boolean chunked = randomBoolean();
+
+        HoldBulksPlugin.holding = true;
+        var response = CompletableFuture.supplyAsync(() -> {
+            try {
+                return post(index, payload, Map.of("refresh", "true", "op_type", "index", "bulk_rows", "1"), chunked);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        try {
+            for (int i = 0; i < recordBatches; i++) {
+                // The next bulk request is only sent when the previous one has completed
+                assertBusy(() -> assertThat(HoldBulksPlugin.held.size(), greaterThanOrEqualTo(1)));
+                assertThat("one bulk request at a time", HoldBulksPlugin.held.size(), equalTo(1));
+                HoldBulksPlugin.releaseAll();
+            }
+        } finally {
+            HoldBulksPlugin.holding = false;
+            HoldBulksPlugin.releaseAll();
+        }
+
+        assertThat(failures(response.get(30, java.util.concurrent.TimeUnit.SECONDS)), empty());
+        assertCount(index, 1);
+        assertEquals(recordBatches - 1, ((Number) client().prepareGet(index, "x").get().getSourceAsMap().get("ints")).intValue());
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------------------------
     // Client disconnections
 
     private long openHttpConnections() {
@@ -1046,7 +1128,14 @@ public abstract class ArrowBulkTestCase extends ESSingleNodeRestTestCase {
             streamAndDisconnect(
                 index,
                 firstChunk,
-                () -> assertBusy(() -> assertThat("a bulk request should be running", HoldBulksPlugin.held.size(), equalTo(1))),
+                () -> assertBusy(
+                    // Without ids, the bulk requests run at the same time: there is one for each record batch
+                    () -> assertThat(
+                        "a bulk request per record batch should be running",
+                        HoldBulksPlugin.held.size(),
+                        equalTo(recordBatches)
+                    )
+                ),
                 // The client is gone, and the bulk request completes now
                 () -> {
                     HoldBulksPlugin.holding = false;
